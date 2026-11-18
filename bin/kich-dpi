@@ -34,7 +34,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-VERSION = "0.4.4"
+VERSION = "0.4.5"
 
 UNIT = "kich-dpi.service"
 TABLE = "kich_dpi"
@@ -110,9 +110,10 @@ CF_HEADERS = {
 WARP_ENDPOINTS = ("162.159.198.2", "162.159.199.2", "162.159.197.2", "162.159.196.2")
 # One pinned gateway instead of a latency-rotated pool. Switching between
 # gateways mid-session dropped roughly a third of the TLS handshakes while a
-# pinned one answered 40 of 40 in a row. 198.2 is the H2 endpoint WARP's own
-# clients use.
-WARP_ENDPOINT = "162.159.198.2"
+# pinned one answered 40 of 40 in a row. The pinned address is not permanent:
+# in the evening 198.2 answered TLS in 2.6-3.4 s (and timed out twice) while
+# 199.2 answered in 0.13-0.22 s and pushed 4.4 MB/s, so 199.2 is the pin.
+WARP_ENDPOINT = "162.159.199.2"
 WARP_SNI = "speed.cloudflare.com"
 # mihomo marks every socket it opens with this value (`routing-mark`). DPI used
 # to skip those packets: the desync appeared to break mihomo's userspace stack,
