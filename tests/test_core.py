@@ -254,6 +254,32 @@ class WarpTest(unittest.TestCase):
         self.assertLess(mod.DPI_RULE_PRIORITY, 9000)
 
 
+class SetupRestartTest(unittest.TestCase):
+    def setUp(self):
+        self.mod = load()
+
+    def test_restarts_only_what_was_up(self):
+        from unittest import mock
+        calls = []
+
+        def fake(action, *args, **kwargs):
+            calls.append(action)
+            return subprocess.CompletedProcess(action, 0, "", "")
+
+        with mock.patch.object(self.mod, "systemctl", fake), \
+             mock.patch.object(self.mod, "warp_systemctl", fake), \
+             mock.patch.object(self.mod, "warp_unit_state", lambda: ("active", "")):
+            self.mod.restart_services(True)
+        self.assertEqual(calls, ["restart", "restart"])
+
+        calls.clear()
+        with mock.patch.object(self.mod, "systemctl", fake), \
+             mock.patch.object(self.mod, "warp_systemctl", fake), \
+             mock.patch.object(self.mod, "warp_unit_state", lambda: ("inactive", "")):
+            self.mod.restart_services(False)
+        self.assertEqual(calls, [])
+
+
 class StateTest(unittest.TestCase):
     def setUp(self):
         self.mod = load()

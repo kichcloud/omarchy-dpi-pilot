@@ -34,7 +34,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-VERSION = "0.2.3"
+VERSION = "0.2.4"
 
 UNIT = "kich-dpi.service"
 TABLE = "kich_dpi"
@@ -771,6 +771,14 @@ def install_system(user):
         pass
 
 
+def restart_services(was_running):
+    """Restart what was already up so the new app copy is the one executing."""
+    if was_running:
+        systemctl("restart", timeout=30)
+    if warp_unit_state()[0] == "active":
+        warp_systemctl("restart", timeout=30)
+
+
 def cmd_setup(archive_arg=""):
     require_root()
     user = target_user()
@@ -791,6 +799,10 @@ def cmd_setup(archive_arg=""):
             if installed():
                 install_app()
                 install_system(user)
+                # The app on disk is new, the running services still execute
+                # the old copy: restart them here too, otherwise an update made
+                # while GitHub rate-limits us looks like it did nothing.
+                restart_services(was_running)
                 out({"ok": True, "version": previous, "previous": previous,
                      "note": "сеть недоступна, системная часть обновлена без движка",
                      "detail": str(exc)[:200]})
@@ -832,16 +844,12 @@ def cmd_setup(archive_arg=""):
     install_system(user)
 
     warp_note = ""
-    warp_active = warp_unit_state()[0] == "active"
     try:
         install_mihomo()
     except Fail as exc:
         warp_note = str(exc)[:200]
 
-    if was_running:
-        systemctl("restart", timeout=30)
-    if warp_active:
-        warp_systemctl("restart", timeout=30)
+    restart_services(was_running)
 
     out({"ok": True, "version": tag, "previous": previous,
          "user": user.pw_name, "installed": int(time.time()),
