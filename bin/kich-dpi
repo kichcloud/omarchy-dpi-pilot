@@ -1,0 +1,1136 @@
+#!/usr/bin/env python3
+"""kich-dpi: a small zapret2 DPI bypass manager for Omarchy.
+
+The plugin intentionally has no host lists, presets or tabs. It generates
+nfqws2 configurations from a handful of primitives, measures them against a
+few blocked services, and keeps the best one. Everything the QML panel needs
+comes from one JSON object on stdout.
+
+Run `kich-dpi --help` for the command list.
+"""
+
+from __future__ import annotations
+
+import fcntl
+import grp
+import hashlib
+import json
+import os
+import platform
+import pwd
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+import urllib.request
+from pathlib import Path
+
+VERSION = "0.1.0"
+
+UNIT = "kich-dpi.service"
+TABLE = "kich_dpi"
+QUEUE = 230
+FWMARK = "0x10000000"
+ENGINE_SLUG = "kich-dpi"
+ENGINE_ROOT = Path("/opt") / ENGINE_SLUG
+APP_DIR = ENGINE_ROOT / "app"
+ENGINE_DIR = ENGINE_ROOT / "engine"
+UNIT_PATH = Path("/etc/systemd/system") / UNIT
+POLKIT_PATH = Path("/etc/polkit-1/rules.d/49-kich-dpi.rules")
+SYSCTL_PATH = Path("/etc/sysctl.d/90-kich-dpi.conf")
+
+RELEASE_API = "https://api.github.com/repos/bol-van/zapret2/releases/latest"
+TARGETS = (
+    ("youtube", "YouTube", "https://www.youtube.com/"),
+    ("discord", "Discord", "https://discord.com/"),
+    ("google", "Google", "https://www.google.com/generate_204"),
+)
+
+HOME = Path(os.environ.get("HOME") or pwd.getpwuid(os.getuid()).pw_dir)
+CONFIG_DIR = HOME / ".config" / ENGINE_SLUG
+STATE_DIR = HOME / ".local" / "state" / ENGINE_SLUG
+RUN_DIR = Path("/run") / ENGINE_SLUG
+ACTIVE_FILE = CONFIG_DIR / "active.json"
+STRATEGIES_FILE = CONFIG_DIR / "strategies.json"
+CHECK_FILE = STATE_DIR / "check.json"
+PROGRESS_FILE = STATE_DIR / "progress.json"
+
+
+class Fail(Exception):
+    pass
+
+
+def out(data):
+    sys.stdout.write(json.dumps(data, ensure_ascii=False, separators=(",", ":")) + "\n")
+
+
+def log(text):
+    sys.stderr.write(str(text).rstrip() + "\n")
+
+
+def read_json(path, fallback):
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            value = json.load(fh)
+        return value if isinstance(value, (dict, list)) else fallback
+    except (OSError, ValueError):
+        return fallback
+
+
+def write_json(path, data):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name("." + path.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, ensure_ascii=False, indent=1)
+        fh.write("\n")
+    os.replace(tmp, path)
+
+
+def require_root():
+    if os.geteuid() != 0:
+        raise Fail("нужен root: запустите через pkexec")
+
+
+def target_user():
+    uid = os.environ.get("PKEXEC_UID") or os.environ.get("SUDO_UID")
+    if uid:
+        try:
+            return pwd.getpwuid(int(uid))
+        except (ValueError, KeyError):
+            pass
+    if os.geteuid() != 0:
+        return pwd.getpwuid(os.geteuid())
+    raise Fail("не удалось определить пользователя: запустите установку из своей сессии")
+
+
+def machine_arch():
+    machine = platform.machine().lower()
+    table = {
+        "x86_64": "x86_64",
+        "amd64": "x86_64",
+        "aarch64": "arm64",
+        "arm64": "arm64",
+        "armv7l": "arm",
+        "armv6l": "arm",
+        "i686": "x86",
+        "i386": "x86",
+        "riscv64": "riscv64",
+        "mips": "mips",
+        "mipsel": "mipsel",
+        "mips64": "mips64",
+        "ppc": "ppc",
+    }
+    return table.get(machine, machine)
+
+
+def engine_bin():
+    return ENGINE_DIR / "current" / "nfqws2"
+
+
+def engine_lua(name):
+    return ENGINE_DIR / "current" / "lua" / name
+
+
+def installed_version():
+    info = read_json(ENGINE_ROOT / "install.json", {})
+    version = info.get("version") if isinstance(info, dict) else ""
+    if version and engine_bin().exists():
+        return str(version)
+    if engine_bin().exists():
+        return "установлен"
+    return ""
+
+
+def installed():
+    return bool(installed_version()) and engine_lua("zapret-lib.lua").exists() \
+        and engine_lua("zapret-antidpi.lua").exists()
+
+
+def systemctl(*args, timeout=25):
+    try:
+        return subprocess.run(
+            ["systemctl", *args, UNIT],
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return subprocess.CompletedProcess(["systemctl", *args, UNIT], 1, "", str(exc))
+
+
+def unit_state():
+    if not UNIT_PATH.exists() and not installed():
+        return "inactive", "not-found"
+    active = systemctl("is-active").stdout.strip() or "inactive"
+    enabled = systemctl("is-enabled").stdout.strip() or "disabled"
+    return active, enabled
+
+
+def is_running():
+    return unit_state()[0] == "active"
+
+
+def strategy_name(spec):
+    return str(spec.get("name") or "своя стратегия")
+
+
+def strategy_id(spec):
+    payload = json.dumps(spec, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    return hashlib.sha1(payload).hexdigest()[:10]
+
+
+# --------------------------------------------------------------- strategies
+
+FOOLING = {
+    "tcp_md5": "tcp_md5",
+    "ip_ttl": "ip_ttl=1:ip6_ttl=1",
+    "tcp_seq": "tcp_seq=-10000",
+    "tcp_flags": "tcp_flags_unset=ack",
+}
+
+
+def candidates():
+    """A deliberately small, ordered tree of strategies.
+
+    The first four are the combinations that work on most Russian ISPs; the
+    rest vary the split position, fooling and fake repeats. Generation means
+    building these configurations and measuring them, not picking a preset.
+    """
+
+    result = []
+
+    def add(name, action, pos, fool, fake="fake_default_tls", repeats=6,
+            quic="quic_google", quic_repeats=6):
+        result.append({
+            "name": name,
+            "action": action,
+            "pos": pos,
+            "fool": fool,
+            "fake": fake,
+            "repeats": repeats,
+            "quic": quic,
+            "quic_repeats": quic_repeats,
+        })
+
+    add("fake + multidisorder", "multidisorder", "1,midsld", "tcp_md5")
+    add("fake + multisplit", "multisplit", "midsld", "tcp_md5")
+    add("fakeddisorder", "fakeddisorder", "midsld", "tcp_md5", fake=None)
+    add("fakedsplit", "fakedsplit", "midsld", "tcp_md5", fake=None)
+
+    add("fake + disorder · TTL", "multidisorder", "1,midsld", "ip_ttl")
+    add("fake + split · seq", "multisplit", "midsld", "tcp_seq")
+    add("fake ×8 + disorder", "multidisorder", "1,midsld", "tcp_md5", repeats=8,
+        quic="fake_default_quic")
+    add("fake + split · noack", "multisplit", "midsld", "tcp_flags")
+
+    add("fake + split at 1", "multisplit", "1,midsld", "tcp_md5")
+    add("fake + disorder at 2", "multidisorder", "2", "tcp_seq")
+    add("fakedsplit at 1", "fakedsplit", "1", "tcp_md5", fake=None)
+    add("fake + split · sld", "multisplit", "sld+1", "tcp_md5",
+        quic="quic_google", quic_repeats=4)
+
+    return result
+
+
+def default_spec():
+    return candidates()[0]
+
+
+def render_config(spec, dry_run=False):
+    """Render one nfqws2 config. Every line is exactly one option."""
+    lines = [
+        "--qnum=%d" % QUEUE,
+        "--fwmark=%s" % FWMARK,
+        "--comment=kich-dpi",
+        "--ctrack-disable=0",
+        "--ipcache-lifetime=8400",
+        "--lua-init=@%s" % engine_lua("zapret-lib.lua"),
+        "--lua-init=@%s" % engine_lua("zapret-antidpi.lua"),
+        "--blob=tls_google:@%s" % (ENGINE_DIR / "current" / "files" / "fake" / "tls_clienthello_www_google_com.bin"),
+        "--blob=quic_google:@%s" % (ENGINE_DIR / "current" / "files" / "fake" / "quic_initial_www_google_com.bin"),
+    ]
+    if dry_run:
+        lines.insert(0, "--dry-run")
+
+    lines += [
+        "--filter-tcp=80",
+        "--filter-l7=http",
+        "--payload=http_req",
+        "--out-range=-d12",
+        "--lua-desync=fake:blob=fake_default_http:tcp_md5",
+        "--lua-desync=multisplit:pos=method+2",
+        "--new",
+        "--filter-tcp=443",
+        "--filter-l7=tls",
+        "--payload=tls_client_hello",
+        "--out-range=-d12",
+    ]
+
+    action = str(spec.get("action") or "multisplit")
+    pos = str(spec.get("pos") or "midsld")
+    fool = FOOLING.get(str(spec.get("fool") or ""), "")
+    fake = spec.get("fake")
+    repeats = max(1, int(spec.get("repeats") or 1))
+
+    if fake:
+        args = "blob=%s:repeats=%d" % (fake, repeats)
+        if fool:
+            args += ":" + fool
+        args += ":tls_mod=rnd,rndsni"
+        lines.append("--lua-desync=fake:" + args)
+
+    if action in ("fakedsplit", "fakeddisorder"):
+        args = "pattern=tls_google:pos=%s" % pos
+        if fool:
+            args += ":" + fool
+        lines.append("--lua-desync=%s:%s" % (action, args))
+    else:
+        args = "pos=%s" % pos
+        if fool and action in ("multisplit", "multidisorder"):
+            args += ":" + fool
+        lines.append("--lua-desync=%s:%s" % (action, args))
+
+    quic = str(spec.get("quic") or "quic_google")
+    quic_repeats = max(1, int(spec.get("quic_repeats") or 6))
+    lines += [
+        "--new",
+        "--filter-udp=443",
+        "--filter-l7=quic",
+        "--payload=quic_initial",
+        "--lua-desync=fake:blob=%s:repeats=%d" % (quic, quic_repeats),
+    ]
+    return "\n".join(lines) + "\n"
+
+
+# ------------------------------------------------------------------ probing
+
+def curl_available():
+    return shutil.which("curl") is not None
+
+
+def probe(targets=TARGETS, timeout=7):
+    if not curl_available():
+        raise Fail("не найден curl")
+    results = []
+    for key, label, url in targets:
+        started = time.monotonic()
+        try:
+            cp = subprocess.run(
+                [
+                    "curl", "-sS", "-o", "/dev/null",
+                    "--connect-timeout", "4", "--max-time", str(timeout),
+                    "-A", "Mozilla/5.0 (X11; Linux x86_64)",
+                    "-w", "%{http_code} %{time_total}",
+                    url,
+                ],
+                capture_output=True, text=True, timeout=timeout + 3,
+            )
+            parts = (cp.stdout or "").strip().split()
+            code = int(parts[0]) if parts and parts[0].isdigit() else 0
+            elapsed = float(parts[1]) if len(parts) > 1 else (time.monotonic() - started)
+            ok = cp.returncode == 0 and 200 <= code < 400
+            error = "" if ok else (cp.stderr or "").strip().splitlines()[-1:] or ""
+            if isinstance(error, list):
+                error = error[0] if error else ""
+        except (OSError, subprocess.SubprocessError, ValueError) as exc:
+            code, elapsed, ok, error = 0, time.monotonic() - started, False, str(exc)
+        results.append({
+            "key": key,
+            "label": label,
+            "ok": ok,
+            "code": code,
+            "ms": int(round(elapsed * 1000)),
+            "error": error[:160],
+        })
+        time.sleep(0.15)
+    passed = sum(1 for row in results if row["ok"])
+    latency = sum(row["ms"] for row in results if row["ok"]) if passed else 10 ** 9
+    return {
+        "time": int(time.time()),
+        "passed": passed,
+        "total": len(results),
+        "ms": latency,
+        "results": results,
+    }
+
+
+def score(result):
+    if not result.get("passed"):
+        return (0, -10 ** 9)
+    return (int(result["passed"]), -int(result.get("ms") or 10 ** 9))
+
+
+def result_line(result):
+    return "%d/%d · %.1f с" % (
+        int(result.get("passed") or 0),
+        int(result.get("total") or 0),
+        (int(result.get("ms") or 0) / 1000.0) if result.get("passed") else 0,
+    )
+
+
+# ------------------------------------------------------------------- install
+
+def release_info():
+    req = urllib.request.Request(RELEASE_API, headers={
+        "User-Agent": "kich-dpi/%s" % VERSION,
+        "Accept": "application/vnd.github+json",
+    })
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        data = json.load(resp)
+    tag = str(data.get("tag_name") or "")
+    assets = {str(a.get("name")): a for a in data.get("assets") or []}
+    name = "zapret2-%s.tar.gz" % tag
+    asset = assets.get(name)
+    if not tag or not asset:
+        raise Fail("в последнем релизе zapret2 нет %s" % name)
+    return tag, str(asset.get("browser_download_url") or ""), str(asset.get("digest") or "")
+
+
+def download(url, dest):
+    req = urllib.request.Request(url, headers={"User-Agent": "kich-dpi/%s" % VERSION})
+    with urllib.request.urlopen(req, timeout=120) as resp, open(dest, "wb") as fh:
+        shutil.copyfileobj(resp, fh, 1024 * 256)
+
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 256), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def extract_engine(archive, tag):
+    arch = machine_arch()
+    stage = ENGINE_DIR / (".%s.new" % tag)
+    if stage.exists():
+        shutil.rmtree(stage)
+    stage.mkdir(parents=True)
+
+    with tempfile.TemporaryDirectory(prefix="kich-dpi-") as tmp:
+        tmpdir = Path(tmp)
+        with tarfile.open(archive, "r:gz") as tf:
+            for member in tf.getmembers():
+                if not member.isfile():
+                    continue
+                name = Path(member.name)
+                if name.is_absolute() or ".." in name.parts:
+                    continue
+                tf.extract(member, tmpdir)
+
+        roots = [p for p in tmpdir.iterdir() if p.is_dir()]
+        if not roots:
+            raise Fail("архив zapret2 пуст")
+        root = roots[0]
+
+        binary = root / "binaries" / ("linux-" + arch) / "nfqws2"
+        if not binary.exists():
+            raise Fail("в релизе нет nfqws2 для linux-%s" % arch)
+        shutil.copy2(binary, stage / "nfqws2")
+        os.chmod(stage / "nfqws2", 0o755)
+
+        lua_src = root / "lua"
+        if not lua_src.is_dir():
+            raise Fail("в релизе нет lua/")
+        shutil.copytree(lua_src, stage / "lua")
+
+        fake_src = root / "files" / "fake"
+        if fake_src.is_dir():
+            shutil.copytree(fake_src, stage / "files" / "fake")
+        else:
+            raise Fail("в релизе нет files/fake")
+
+    target = ENGINE_DIR / tag
+    if target.exists():
+        shutil.rmtree(target)
+    stage.rename(target)
+
+    current = ENGINE_DIR / "current"
+    if current.is_symlink() or current.exists():
+        current.unlink()
+    current.symlink_to(tag)
+    return target
+
+
+def write_text(path, text, mode=0o644):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name("." + path.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+UNIT_TEMPLATE = """# Installed by kich-dpi (Omarchy plugin). Removed by `kich-dpi remove`.
+[Unit]
+Description=DPI bypass for Omarchy (kich-dpi)
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/opt/kich-dpi/engine/current/nfqws2
+
+[Service]
+Type=simple
+User={user}
+Group={group}
+Environment=HOME={home}
+RuntimeDirectory=kich-dpi
+RuntimeDirectoryMode=0700
+ExecStart=/usr/bin/python3 -I /opt/kich-dpi/app/bin/kich-dpi _run
+ExecStopPost=/usr/bin/python3 -I /opt/kich-dpi/app/bin/kich-dpi _fw-down
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=6
+NoNewPrivileges=yes
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=-{home}/.config/kich-dpi -{home}/.local/state/kich-dpi
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+POLKIT_TEMPLATE = """// Installed by kich-dpi. Allows the session user to start and stop the bypass.
+polkit.addRule(function(action, subject) {{
+  if (action.id !== "org.freedesktop.systemd1.manage-units") return;
+  if (subject.user !== "{user}") return;
+  var unit = action.lookup("unit");
+  if (unit === "{unit}") return polkit.Result.YES;
+}});
+"""
+
+
+def install_app():
+    src = Path(__file__).resolve()
+    dest = APP_DIR / "bin" / "kich-dpi"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if src != dest:
+        shutil.copy2(src, dest)
+    os.chmod(dest, 0o755)
+
+
+def install_system(user):
+    try:
+        group = grp.getgrgid(user.pw_gid).gr_name
+    except KeyError:
+        group = user.pw_name
+    write_text(UNIT_PATH, UNIT_TEMPLATE.format(
+        user=user.pw_name, group=group, home=user.pw_dir,
+    ))
+    write_text(POLKIT_PATH, POLKIT_TEMPLATE.format(user=user.pw_name, unit=UNIT))
+    write_text(SYSCTL_PATH, "net.netfilter.nf_conntrack_tcp_be_liberal=1\n")
+    subprocess.run(["systemctl", "daemon-reload"], capture_output=True, text=True)
+    try:
+        subprocess.run(
+            ["sysctl", "-q", "-w", "net.netfilter.nf_conntrack_tcp_be_liberal=1"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def cmd_setup(archive_arg=""):
+    require_root()
+    user = target_user()
+    was_running = is_running()
+    previous = installed_version()
+
+    archive = Path(archive_arg) if archive_arg else None
+    tag = ""
+    digest = ""
+    if archive:
+        tag = "custom-" + sha256_file(archive)[:8]
+        if not archive.exists():
+            raise Fail("архив не найден: %s" % archive)
+    else:
+        try:
+            tag, url, digest = release_info()
+        except Exception as exc:
+            if installed():
+                install_app()
+                install_system(user)
+                out({"ok": True, "version": previous, "previous": previous,
+                     "note": "сеть недоступна, системная часть обновлена без движка",
+                     "detail": str(exc)[:200]})
+                return
+            raise Fail("не удалось получить релиз zapret2: %s" % exc)
+
+    if archive or tag != previous or not (ENGINE_DIR / tag / "nfqws2").exists():
+        with tempfile.TemporaryDirectory(prefix="kich-dpi-") as tmp:
+            tar_path = Path(tmp) / "zapret2.tar.gz"
+            if archive:
+                shutil.copy2(archive, tar_path)
+            else:
+                try:
+                    download(url, tar_path)
+                except Exception as exc:
+                    raise Fail("не удалось скачать zapret2: %s" % exc)
+                if digest.startswith("sha256:"):
+                    actual = "sha256:" + sha256_file(tar_path)
+                    if actual.lower() != digest.lower():
+                        raise Fail("sha256 не совпал: ожидался %s" % digest)
+            extract_engine(tar_path, tag)
+    else:
+        current = ENGINE_DIR / "current"
+        if not current.is_symlink() or os.readlink(current) != tag:
+            if current.is_symlink() or current.exists():
+                current.unlink()
+            current.symlink_to(tag)
+
+    write_json(ENGINE_ROOT / "install.json", {
+        "version": tag,
+        "installed": int(time.time()),
+        "sha256": digest,
+    })
+    write_text(ENGINE_ROOT / "README", (
+        "Engine: zapret2 by bol-van (https://github.com/bol-van/zapret2).\n"
+        "Installed by the kich-dpi Omarchy plugin. The plugin code is MIT.\n"
+    ))
+    install_app()
+    install_system(user)
+
+    if was_running:
+        systemctl("restart", timeout=30)
+
+    out({"ok": True, "version": tag, "previous": previous,
+         "user": user.pw_name, "installed": int(time.time())})
+
+
+def cmd_remove(purge=False):
+    require_root()
+    user = target_user()
+    subprocess.run(["systemctl", "disable", "--now", UNIT], capture_output=True, text=True)
+    for path in (UNIT_PATH, POLKIT_PATH, SYSCTL_PATH):
+        try:
+            path.unlink()
+        except OSError:
+            pass
+    subprocess.run(["systemctl", "daemon-reload"], capture_output=True, text=True)
+    if ENGINE_ROOT.exists():
+        shutil.rmtree(ENGINE_ROOT)
+    if purge:
+        home = Path(user.pw_dir)
+        for path in (home / ".config" / ENGINE_SLUG, home / ".local" / "state" / ENGINE_SLUG):
+            if path.exists():
+                shutil.rmtree(path)
+    out({"ok": True, "removed": True, "purged": bool(purge)})
+
+
+# -------------------------------------------------------------------- state
+
+def progress_data():
+    data = read_json(PROGRESS_FILE, {})
+    if not isinstance(data, dict):
+        return {}
+    if data.get("running") and time.time() - int(data.get("started") or 0) > 1800:
+        data["running"] = False
+        data["error"] = "подбор прерван"
+    return data
+
+
+def status_data():
+    version = installed_version()
+    active, enabled = unit_state()
+    running = active == "active"
+    failed = active == "failed"
+    active_doc = read_json(ACTIVE_FILE, {})
+    if not isinstance(active_doc, dict):
+        active_doc = {}
+    spec = active_doc.get("spec") if isinstance(active_doc.get("spec"), dict) else {}
+    check = read_json(CHECK_FILE, {})
+    if not isinstance(check, dict):
+        check = {}
+    progress = progress_data()
+    saved = read_json(STRATEGIES_FILE, [])
+    if not isinstance(saved, list):
+        saved = []
+
+    rows = []
+    for item in saved:
+        if not isinstance(item, dict):
+            continue
+        rows.append({
+            "id": str(item.get("id") or ""),
+            "name": str(item.get("name") or ""),
+            "passed": int(item.get("passed") or 0),
+            "total": int(item.get("total") or 0),
+            "ms": int(item.get("ms") or 0),
+            "time": int(item.get("time") or 0),
+        })
+    rows.sort(key=lambda r: (-r["passed"], r["ms"]))
+
+    other = False
+    try:
+        cp = subprocess.run(["systemctl", "is-active", "omarchy-zapret2.service"],
+                            capture_output=True, text=True, timeout=4)
+        other = cp.stdout.strip() == "active"
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+    error = ""
+    if not installed():
+        error = "движок не установлен"
+    elif failed:
+        error = "служба не запустилась"
+
+    return {
+        "ok": True,
+        "version": VERSION,
+        "installed": installed(),
+        "engine": version,
+        "unit": UNIT,
+        "running": running,
+        "failed": failed,
+        "active": active,
+        "enabled": enabled,
+        "active_id": str(active_doc.get("id") or ""),
+        "active_name": strategy_name(spec) if spec else "",
+        "check": check,
+        "generating": bool(progress.get("running")),
+        "progress": progress,
+        "strategies": rows[:8],
+        "conflict": other,
+        "error": error,
+    }
+
+
+def apply_spec(spec, start=True):
+    write_json(ACTIVE_FILE, {
+        "id": strategy_id(spec),
+        "name": strategy_name(spec),
+        "spec": spec,
+        "time": int(time.time()),
+    })
+    if start:
+        cp = systemctl("restart", timeout=30)
+        if cp.returncode != 0:
+            raise Fail((cp.stderr or cp.stdout or "systemctl restart не удался").strip()[-400:])
+
+
+def wait_active(timeout=8.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if is_running():
+            return True
+        time.sleep(0.25)
+    return False
+
+
+def cmd_on():
+    if not installed():
+        raise Fail("сначала установите движок")
+    cp = systemctl("enable", "--now", timeout=35)
+    if cp.returncode != 0:
+        raise Fail((cp.stderr or cp.stdout or "не удалось запустить службу").strip()[-400:])
+    out(status_data())
+
+
+def cmd_off():
+    cp = systemctl("disable", "--now", timeout=35)
+    if cp.returncode != 0 and installed():
+        raise Fail((cp.stderr or cp.stdout or "не удалось остановить службу").strip()[-400:])
+    out(status_data())
+
+
+def cmd_toggle():
+    if is_running():
+        cmd_off()
+    else:
+        cmd_on()
+
+
+def cmd_restart():
+    cp = systemctl("restart", timeout=30)
+    if cp.returncode != 0:
+        raise Fail((cp.stderr or cp.stdout or "systemctl restart не удался").strip()[-400:])
+    out(status_data())
+
+
+def cmd_check():
+    if not installed():
+        raise Fail("сначала установите движок")
+    result = probe()
+    write_json(CHECK_FILE, result)
+    out({"ok": True, "check": result, "running": is_running()})
+
+
+def cmd_use(strategy_id_arg):
+    saved = read_json(STRATEGIES_FILE, [])
+    spec = None
+    if isinstance(saved, list):
+        for item in saved:
+            if isinstance(item, dict) and str(item.get("id")) == str(strategy_id_arg):
+                spec = item.get("spec")
+                break
+    if not isinstance(spec, dict):
+        raise Fail("стратегия не найдена")
+    apply_spec(spec, start=True)
+    out({"ok": True, "active_id": strategy_id(spec), "active_name": strategy_name(spec)})
+
+
+def merge_strategies(rows):
+    saved = read_json(STRATEGIES_FILE, [])
+    if not isinstance(saved, list):
+        saved = []
+    by_id = {}
+    for item in saved:
+        if isinstance(item, dict) and item.get("id"):
+            by_id[str(item["id"])] = item
+    for item in rows:
+        by_id[str(item["id"])] = item
+    ordered = sorted(
+        by_id.values(),
+        key=lambda r: (-int(r.get("passed") or 0), int(r.get("ms") or 10 ** 9)),
+    )[:8]
+    write_json(STRATEGIES_FILE, ordered)
+
+
+def cmd_generate():
+    if not installed():
+        raise Fail("сначала установите движок")
+    if not curl_available():
+        raise Fail("не найден curl")
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+
+    lock = open(STATE_DIR / "generate.lock", "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        lock.close()
+        raise Fail("подбор уже идёт")
+
+    was_running = is_running()
+    original_doc = read_json(ACTIVE_FILE, {})
+    original = original_doc.get("spec") if isinstance(original_doc.get("spec"), dict) else None
+    fallback = original if original else default_spec()
+
+    started = int(time.time())
+    progress = {
+        "running": True,
+        "started": started,
+        "done": 0,
+        "total": len(candidates()),
+        "current": "",
+        "best": None,
+        "error": "",
+    }
+    write_json(PROGRESS_FILE, progress)
+
+    baseline = None
+    best = None
+    rows = []
+    try:
+        baseline = probe()
+        for index, spec in enumerate(candidates(), 1):
+            progress.update({
+                "running": True,
+                "done": index - 1,
+                "current": strategy_name(spec),
+            })
+            write_json(PROGRESS_FILE, progress)
+
+            error = ""
+            try:
+                apply_spec(spec, start=True)
+                if not wait_active():
+                    raise Fail("служба не запустилась")
+                result = probe()
+            except Fail as exc:
+                error = str(exc)
+                result = {"passed": 0, "total": len(TARGETS), "ms": 10 ** 9,
+                          "results": [], "time": int(time.time()), "error": error}
+
+            if result["passed"] > 0:
+                rows.append({
+                    "id": strategy_id(spec),
+                    "name": strategy_name(spec),
+                    "spec": spec,
+                    "passed": result["passed"],
+                    "total": result["total"],
+                    "ms": result["ms"],
+                    "time": int(time.time()),
+                })
+
+            if best is None or score(result) > score(best[1]):
+                best = (spec, result)
+                progress["best"] = {
+                    "name": strategy_name(spec),
+                    "passed": result["passed"],
+                    "total": result["total"],
+                    "ms": result["ms"],
+                }
+            progress["done"] = index
+            write_json(PROGRESS_FILE, progress)
+    finally:
+        # Always leave a working configuration behind, even after Ctrl+C.
+        keep_original = False
+        if best is None:
+            keep_original = True
+        elif baseline is not None and score(baseline) >= score(best[1]):
+            keep_original = True
+        try:
+            if keep_original:
+                if original:
+                    if was_running:
+                        apply_spec(original, start=True)
+                elif was_running:
+                    apply_spec(fallback, start=True)
+                else:
+                    systemctl("stop", timeout=20)
+            else:
+                apply_spec(best[0], start=True)
+        except Fail as exc:
+            progress["error"] = str(exc)
+
+        if rows:
+            merge_strategies(rows)
+        progress["running"] = False
+        progress["done"] = progress.get("done") or 0
+        progress["kept_original"] = keep_original
+        progress["finished"] = int(time.time())
+        if not progress.get("error") and best and best[1]["passed"] == 0:
+            progress["error"] = "ни одна стратегия не прошла проверку"
+        write_json(PROGRESS_FILE, progress)
+        lock.close()
+
+    final = baseline if baseline is not None else read_json(CHECK_FILE, {})
+    if not progress.get("kept_original") and best is not None:
+        final = best[1]
+    if isinstance(final, dict) and final:
+        write_json(CHECK_FILE, final)
+    out({
+        "ok": True,
+        "baseline": baseline,
+        "best": None if best is None else {
+            "name": strategy_name(best[0]),
+            "passed": best[1]["passed"],
+            "total": best[1]["total"],
+            "ms": best[1]["ms"],
+        },
+        "kept_original": bool(progress.get("kept_original")),
+        "error": progress.get("error", ""),
+        "check": final,
+    })
+
+
+# ------------------------------------------------------------------- engine
+
+NFT_SCRIPT = """table inet {table} {{
+  chain predefrag {{
+    type filter hook output priority -401; policy accept;
+    meta mark and {mark} != 0 notrack comment "kich-dpi generated"
+  }}
+  chain out {{
+    type filter hook postrouting priority 101; policy accept;
+    meta oiftype 65534 return comment "skip tunnels"
+    meta mark and {mark} != 0 return
+    tcp dport {{ 80, 443 }} ct original packets 1-16 queue num {queue} bypass
+    udp dport 443 ct original packets 1-6 queue num {queue} bypass
+  }}
+  chain in {{
+    type filter hook prerouting priority -101; policy accept;
+    meta iiftype 65534 return comment "skip tunnels"
+    meta mark and {mark} != 0 return
+    tcp sport {{ 80, 443 }} ct reply packets 1-12 queue num {queue} bypass
+    udp sport 443 ct reply packets 1-4 queue num {queue} bypass
+  }}
+}}
+"""
+
+
+def fw_up():
+    script = NFT_SCRIPT.format(table=TABLE, mark=FWMARK, queue=QUEUE)
+    subprocess.run(["nft", "delete", "table", "inet", TABLE],
+                   capture_output=True, text=True)
+    cp = subprocess.run(["nft", "-f", "-"], input=script,
+                        capture_output=True, text=True)
+    if cp.returncode != 0:
+        raise Fail("nft: " + (cp.stderr or cp.stdout).strip()[-500:])
+
+
+def fw_down():
+    try:
+        subprocess.run(["nft", "delete", "table", "inet", TABLE],
+                       capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def cmd__fw_down():
+    fw_down()
+    return 0
+
+
+def cmd__run():
+    if not installed():
+        log("kich-dpi: engine is not installed")
+        return 1
+    active_doc = read_json(ACTIVE_FILE, {})
+    spec = active_doc.get("spec") if isinstance(active_doc.get("spec"), dict) else default_spec()
+    conf = RUN_DIR / "nfqws2.conf"
+    try:
+        RUN_DIR.mkdir(parents=True, exist_ok=True)
+        write_text(conf, render_config(spec), 0o600)
+        fw_up()
+    except (OSError, Fail) as exc:
+        log("kich-dpi: setup failed: %s" % exc)
+        return 1
+
+    child = None
+    try:
+        child = subprocess.Popen([str(engine_bin()), "@%s" % conf])
+    except OSError as exc:
+        log("kich-dpi: cannot start nfqws2: %s" % exc)
+        fw_down()
+        return 1
+
+    stopping = {"value": False}
+
+    def stop(signum, _frame):
+        stopping["value"] = True
+        if child and child.poll() is None:
+            child.terminate()
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    while True:
+        code = child.poll()
+        if code is not None:
+            break
+        time.sleep(0.3)
+        if stopping["value"] and child.poll() is None:
+            try:
+                child.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                child.kill()
+    fw_down()
+    return 0 if stopping["value"] else (child.returncode or 0)
+
+
+# --------------------------------------------------------------- diagnostics
+
+def cmd_logs(count):
+    try:
+        cp = subprocess.run(
+            ["journalctl", "-u", UNIT, "-n", str(max(1, int(count))),
+             "--no-pager", "-o", "cat"],
+            capture_output=True, text=True, timeout=15,
+        )
+        lines = [line for line in cp.stdout.splitlines() if line.strip()]
+    except (OSError, subprocess.SubprocessError) as exc:
+        lines = ["journalctl: %s" % exc]
+    out({"ok": True, "lines": lines[-max(1, int(count)):]})
+
+
+def cmd_doctor():
+    checks = []
+
+    def add(name, ok, detail=""):
+        checks.append({"name": name, "ok": bool(ok), "detail": str(detail)[:300]})
+
+    add("движок", installed(), installed_version())
+    if installed():
+        try:
+            cp = subprocess.run([str(engine_bin()), "--version"],
+                                capture_output=True, text=True, timeout=10)
+            add("nfqws2", cp.returncode == 0, (cp.stdout or cp.stderr).strip())
+        except (OSError, subprocess.SubprocessError) as exc:
+            add("nfqws2", False, exc)
+    add("systemd unit", UNIT_PATH.exists(), UNIT_PATH)
+    add("polkit", POLKIT_PATH.exists(), POLKIT_PATH)
+    add("curl", curl_available(), shutil.which("curl") or "")
+    add("nft", shutil.which("nft") is not None, shutil.which("nft") or "")
+    state = status_data()
+    add("служба", not state["failed"], state["active"])
+    add("конфликт zapret2", not state["conflict"],
+        "omarchy-zapret2 активен" if state["conflict"] else "нет")
+    if state["active_name"]:
+        add("стратегия", True, state["active_name"])
+    out({"ok": True, "checks": checks, "status": state})
+
+
+def main(argv):
+    if len(argv) < 2 or argv[1] in ("-h", "--help", "help"):
+        sys.stdout.write(__doc__.strip() + "\n\n"
+            "Команды:\n"
+            "  status                 состояние для панели (JSON)\n"
+            "  on | off | toggle      включить/выключить службу\n"
+            "  check                  проверить YouTube, Discord и Google\n"
+            "  generate               собрать и измерить стратегии, оставить лучшую\n"
+            "  strategies             сохранённые стратегии\n"
+            "  use <id>               применить сохранённую стратегию\n"
+            "  setup [archive]        установить движок (pkexec)\n"
+            "  update                 обновить движок (pkexec)\n"
+            "  remove [--purge]       удалить системную часть (pkexec)\n"
+            "  logs [N]               последние строки журнала\n"
+            "  doctor                 диагностика\n")
+        return 0
+
+    cmd = argv[1]
+    try:
+        if cmd == "_run":
+            return cmd__run()
+        if cmd == "_fw-down":
+            return cmd__fw_down()
+        if cmd == "status":
+            out(status_data())
+        elif cmd == "on":
+            cmd_on()
+        elif cmd == "off":
+            cmd_off()
+        elif cmd == "toggle":
+            cmd_toggle()
+        elif cmd == "restart":
+            cmd_restart()
+        elif cmd == "check":
+            cmd_check()
+        elif cmd == "generate":
+            cmd_generate()
+        elif cmd == "strategies":
+            out({"ok": True, "strategies": status_data()["strategies"]})
+        elif cmd == "use":
+            if len(argv) < 3:
+                raise Fail("использование: use <id>")
+            cmd_use(argv[2])
+        elif cmd == "setup":
+            cmd_setup(argv[2] if len(argv) > 2 else "")
+        elif cmd == "update":
+            cmd_setup("")
+        elif cmd == "remove":
+            cmd_remove("--purge" in argv)
+        elif cmd == "logs":
+            cmd_logs(int(argv[2]) if len(argv) > 2 and argv[2].isdigit() else 80)
+        elif cmd == "doctor":
+            cmd_doctor()
+        else:
+            raise Fail("неизвестная команда: %s" % cmd)
+    except Fail as exc:
+        out({"ok": False, "error": str(exc)})
+    except KeyboardInterrupt:
+        out({"ok": False, "error": "прервано"})
+    except Exception as exc:  # keep the panel alive on unexpected failures
+        out({"ok": False, "error": "%s: %s" % (type(exc).__name__, exc)})
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

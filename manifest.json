@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "id": "kich.dpi-pilot",
+  "name": "DPI Pilot",
+  "version": "0.1.0",
+  "author": "kich",
+  "license": "MIT",
+  "description": "One-button zapret2 DPI bypass for Omarchy: generate strategies, measure YouTube/Discord/Google, keep the best. No lists, tabs or presets.",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "DpiPilot.qml"
+  },
+  "barWidget": {
+    "displayName": "DPI Pilot",
+    "description": "Toggle the DPI bypass, check blocked services and regenerate a strategy in one compact popup.",
+    "category": "Network",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
