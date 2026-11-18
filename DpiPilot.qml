@@ -63,10 +63,17 @@ Panel {
   readonly property string warpConflict: warp.conflict ? String(warp.conflict) : ""
   readonly property string warpAccount: warp.account ? String(warp.account) : ""
   readonly property var warpCheck: warp.check ? warp.check : ({})
+  function compactAddress(value) {
+    var text = String(value || "")
+    // WARP now prefers IPv6, and a full address is too wide for the popup.
+    if (text.indexOf(":") < 0 || text.length <= 24) return text
+    var parts = text.split(":")
+    return parts.slice(0, 3).join(":") + "…" + parts.slice(-2).join(":")
+  }
   readonly property string warpCheckText: {
     if (!warpCheck || !warpCheck.time) return ""
     if (Date.now() / 1000 - warpCheck.time > 900) return ""
-    return warpCheck.ok && warpCheck.ip ? String(warpCheck.ip) : ""
+    return warpCheck.ok && warpCheck.ip ? compactAddress(warpCheck.ip) : ""
   }
   readonly property string warpText: {
     if (!warpAvailable) return "mihomo не установлен — нажмите, чтобы доустановить"
@@ -193,7 +200,7 @@ Panel {
       }
     } else if (name === "warp-check") {
       if (parsed && parsed.check && parsed.check.ok)
-        flash("WARP работает" + (parsed.check.ip ? " · " + parsed.check.ip : ""))
+        flash("WARP работает" + (parsed.check.ip ? " · " + root.compactAddress(parsed.check.ip) : ""))
       else
         actionError = parsed && parsed.check && parsed.check.error
           ? parsed.check.error : "WARP не подтвердился"

@@ -157,15 +157,22 @@ class WarpTest(unittest.TestCase):
         data = yaml.safe_load(self.mod.warp_config_text(self.ACCOUNT))
         self.assertTrue(data["tun"]["enable"])
         self.assertEqual(data["tun"]["device"], "kichwarp")
-        self.assertEqual(len(data["proxies"]), 4)
-        for proxy in data["proxies"]:
-            self.assertEqual(proxy["type"], "masque")
-            self.assertEqual(proxy["port"], 443)
-            self.assertEqual(proxy["network"], "h2")
-            self.assertNotIn("BEGIN", proxy["public-key"])
+        # One pinned gateway: rotating between endpoints dropped handshakes.
+        self.assertEqual(len(data["proxies"]), 1)
+        proxy = data["proxies"][0]
+        self.assertEqual(proxy["name"], "WARP")
+        self.assertEqual(proxy["type"], "masque")
+        self.assertEqual(proxy["port"], 443)
+        self.assertEqual(proxy["network"], "h2")
+        self.assertEqual(proxy["server"], self.mod.WARP_ENDPOINT)
+        # YouTube's IPv4 egress is throttled here; its IPv6 path is clean.
+        self.assertEqual(proxy["ip-version"], "ipv6-prefer")
+        self.assertNotIn("BEGIN", proxy["public-key"])
+        self.assertNotIn("proxy-groups", data)
+        self.assertEqual(data["routing-mark"], 0x20000000)
         self.assertIn("DOMAIN-SUFFIX,gosuslugi.ru,DIRECT", data["rules"])
         self.assertIn("NETWORK,udp,DIRECT", data["rules"])
-        self.assertEqual(data["rules"][-1], "MATCH,PROXY")
+        self.assertEqual(data["rules"][-1], "MATCH,WARP")
 
     def test_missing_account_is_rejected(self):
         with self.assertRaises(self.mod.Fail):
@@ -207,12 +214,15 @@ class WarpTest(unittest.TestCase):
 
     def test_nft_skips_warp_endpoints(self):
         script = self.mod.NFT_SCRIPT.format(
-            table="kich_dpi", mark="0x10000000", queue=230,
-            warp_ips=", ".join(self.mod.WARP_ENDPOINTS))
+            table="kich_dpi", mark="0x10000000", route_mark=self.mod.WARP_MARK,
+            queue=230, warp_ips=", ".join(self.mod.WARP_ENDPOINTS))
         for endpoint in self.mod.WARP_ENDPOINTS:
             self.assertIn(endpoint, script)
         self.assertIn("ip daddr @warp_ep return", script)
         self.assertIn("ip saddr @warp_ep return", script)
+        # Traffic mihomo dials itself goes through its userspace TCP stack;
+        # desyncing it broke RU sites, so it is left alone.
+        self.assertIn("meta mark and %s != 0 return" % self.mod.WARP_MARK, script)
 
 
 class StateTest(unittest.TestCase):
