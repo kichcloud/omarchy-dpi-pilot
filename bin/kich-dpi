@@ -34,12 +34,15 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-VERSION = "0.2.1"
+VERSION = "0.2.2"
 
 UNIT = "kich-dpi.service"
 TABLE = "kich_dpi"
 QUEUE = 230
 FWMARK = "0x10000000"
+# Policy rule that sends DPI-stamped packets out the physical link. mihomo owns
+# the 9000 block, so the DPI rule sits just above it.
+DPI_RULE_PRIORITY = 8999
 ENGINE_SLUG = "kich-dpi"
 ENGINE_ROOT = Path("/opt") / ENGINE_SLUG
 APP_DIR = ENGINE_ROOT / "app"
@@ -1673,6 +1676,12 @@ NFT_SCRIPT = """table inet {table} {{
 """
 
 
+def fw_rule(action):
+    """`ip rule` invocation that pins DPI-stamped packets to the main table."""
+    return ["ip", "rule", action, "fwmark", "%s/%s" % (FWMARK, FWMARK),
+            "lookup", "main", "priority", str(DPI_RULE_PRIORITY)]
+
+
 def fw_up():
     script = NFT_SCRIPT.format(table=TABLE, mark=FWMARK, route_mark=WARP_MARK,
                                queue=QUEUE, warp_ips=", ".join(WARP_ENDPOINTS))
@@ -1682,12 +1691,27 @@ def fw_up():
                         capture_output=True, text=True)
     if cp.returncode != 0:
         raise Fail("nft: " + (cp.stderr or cp.stdout).strip()[-500:])
+    # nfqws2 re-injects every packet it handled with FWMARK. While the WARP TUN
+    # is up, mihomo's own policy rules (iif lo → table 2022) would feed those
+    # packets back into the tunnel, where its gvisor stack cannot replay them:
+    # the desync dies and the connection hangs on the first SYN. The same rule
+    # rescues traffic bound to a physical device, because NetworkManager binds
+    # its connectivity probe with CURLOPT_INTERFACE (`if!enp8s0`) — without it
+    # the shell reported "ограниченный доступ" on a link that was fine.
+    subprocess.run(fw_rule("del"), capture_output=True, text=True)
+    cp = subprocess.run(fw_rule("add"), capture_output=True, text=True)
+    if cp.returncode != 0:
+        raise Fail("ip rule: " + (cp.stderr or cp.stdout).strip()[-500:])
 
 
 def fw_down():
     try:
         subprocess.run(["nft", "delete", "table", "inet", TABLE],
                        capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    try:
+        subprocess.run(fw_rule("del"), capture_output=True, text=True, timeout=10)
     except (OSError, subprocess.SubprocessError):
         pass
 

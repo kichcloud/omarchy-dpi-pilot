@@ -227,6 +227,31 @@ class WarpTest(unittest.TestCase):
         # desyncing it broke RU sites, so it is left alone.
         self.assertIn("meta mark and %s != 0 return" % self.mod.WARP_MARK, script)
 
+    def test_fw_rule_keeps_stamped_packets_off_the_tunnel(self):
+        from unittest import mock
+        mod = self.mod
+        calls = []
+
+        def run(argv, **kwargs):
+            calls.append(list(argv))
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        with mock.patch.object(mod.subprocess, "run", side_effect=run):
+            mod.fw_up()
+            mod.fw_down()
+
+        stamp = "0x10000000/0x10000000"
+        add = ["ip", "rule", "add", "fwmark", stamp, "lookup", "main",
+               "priority", str(mod.DPI_RULE_PRIORITY)]
+        dele = ["ip", "rule", "del", "fwmark", stamp, "lookup", "main",
+                "priority", str(mod.DPI_RULE_PRIORITY)]
+        self.assertIn(add, calls)
+        self.assertIn(dele, calls)
+        # Stale rules from an earlier run must not stack up.
+        self.assertLess(calls.index(dele), calls.index(add))
+        # mihomo's own policy rules start at 9000.
+        self.assertLess(mod.DPI_RULE_PRIORITY, 9000)
+
 
 class StateTest(unittest.TestCase):
     def setUp(self):
