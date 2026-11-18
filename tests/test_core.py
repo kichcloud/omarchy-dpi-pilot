@@ -1,4 +1,5 @@
 import importlib.machinery
+import ipaddress
 import importlib.util
 import io
 import json
@@ -148,6 +149,15 @@ class WarpTest(unittest.TestCase):
 
     def setUp(self):
         self.mod = load()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        base = pathlib.Path(self.tmp.name)
+        # The real paths point into /opt and $HOME; keep every test in a sandbox.
+        self.mod.BUNDLED_RULES = ROOT / "data" / "rules"
+        self.mod.WARP_RULES = base / "rules"
+        self.mod.WARP_USER_DOMAINS = base / "direct-domains.txt"
+        self.mod.WARP_USER_PROCESSES = base / "direct-processes.txt"
+        self.mod.install_rule_lists()
 
     def test_config_is_valid_and_keeps_ru_traffic_direct(self):
         try:
@@ -172,10 +182,126 @@ class WarpTest(unittest.TestCase):
         self.assertNotIn("BEGIN", proxy["public-key"])
         self.assertNotIn("proxy-groups", data)
         self.assertEqual(data["routing-mark"], 0x20000000)
-        self.assertIn("DOMAIN-SUFFIX,gosuslugi.ru,DIRECT", data["rules"])
+        # Diagnostics dial the tunnel through this local proxy, not the TUN.
+        self.assertEqual(data["mixed-port"], self.mod.WARP_MIXED_PORT)
+        self.assertEqual(data["bind-address"], "127.0.0.1")
+        # No process rules: tracking owners would be pure overhead.
+        self.assertEqual(data["find-process-mode"], "off")
+        self.assertEqual(data["rule-providers"]["ru-domain"]["behavior"], "domain")
+        self.assertEqual(data["rule-providers"]["ru-ip"]["behavior"], "ipcidr")
+        self.assertTrue(pathlib.Path(data["rule-providers"]["ru-domain"]["path"]).is_file())
+        self.assertIn("RULE-SET,ru-domain,DIRECT", data["rules"])
+        self.assertIn("RULE-SET,ru-ip,DIRECT,no-resolve", data["rules"])
         self.assertIn("AND,((NETWORK,udp),(DST-PORT,443)),WARP", data["rules"])
         self.assertIn("NETWORK,udp,DIRECT", data["rules"])
         self.assertEqual(data["rules"][-1], "MATCH,WARP")
+
+    def test_user_lists_add_rules_and_turn_on_process_matching(self):
+        try:
+            import yaml
+        except ImportError:
+            self.skipTest("pyyaml is not installed")
+        self.mod.WARP_USER_DOMAINS.write_text("# своё\nmy.example\n", encoding="utf-8")
+        self.mod.WARP_USER_PROCESSES.write_text("telegram\n", encoding="utf-8")
+        data = yaml.safe_load(self.mod.warp_config_text(self.ACCOUNT))
+        self.assertEqual(data["find-process-mode"], "strict")
+        self.assertEqual(data["rules"][0], "PROCESS-NAME,telegram,DIRECT")
+        self.assertIn("RULE-SET,direct-domains,DIRECT", data["rules"])
+        self.assertEqual(data["rule-providers"]["direct-domains"]["path"],
+                         str(self.mod.WARP_USER_DOMAINS))
+
+    def test_comma_in_process_name_is_rejected(self):
+        self.mod.WARP_USER_PROCESSES.write_text("bad,name\n", encoding="utf-8")
+        with self.assertRaises(self.mod.Fail):
+            self.mod.warp_config_text(self.ACCOUNT)
+
+    def test_rule_lists_ship_with_the_plugin(self):
+        domains = self.mod.list_lines(ROOT / "data" / "rules" / "ru-domain.txt")
+        ips = self.mod.list_lines(ROOT / "data" / "rules" / "ru-ip.txt")
+        self.assertIn("gosuslugi.ru", domains)
+        self.assertGreater(len(domains), 40)
+        self.assertNotIn("#", domains[0])
+        self.assertGreater(len(ips), 5000)
+        for item in ips[::200]:
+            ipaddress.ip_network(item)
+
+    def test_user_lists_are_created_once(self):
+        mod = self.mod
+        mod.ensure_user_lists()
+        self.assertTrue(mod.WARP_USER_DOMAINS.is_file())
+        self.assertTrue(mod.WARP_USER_PROCESSES.is_file())
+        mod.WARP_USER_DOMAINS.write_text("kept.example\n", encoding="utf-8")
+        mod.ensure_user_lists()
+        self.assertEqual(mod.WARP_USER_DOMAINS.read_text(encoding="utf-8"), "kept.example\n")
+
+    def test_build_asks_for_the_system_part_when_lists_are_missing(self):
+        from unittest import mock
+        mod = self.mod
+        with mock.patch.object(mod, "warp_account", lambda: dict(self.ACCOUNT)), \
+             mock.patch.object(mod, "WARP_CONFIG",
+                               pathlib.Path(self.tmp.name) / "warp.yaml"), \
+             mock.patch.object(mod, "BUNDLED_RULES", pathlib.Path(self.tmp.name) / "none"):
+            with self.assertRaises(mod.Fail) as ctx:
+                mod.warp_build()
+        self.assertIn("обновите", str(ctx.exception))
+
+    def test_warp_check_dials_the_proxy_port(self):
+        from unittest import mock
+        mod = self.mod
+        trace = "ip=104.28.0.1\nwarp=on\ncolo=DME\n"
+        calls = []
+
+        def fake(argv, **kwargs):
+            calls.append(list(argv))
+            if argv[:2] == ["ip", "route"]:
+                return subprocess.CompletedProcess(argv, 0, "1.1.1.1 dev kichwarp table 2022\n", "")
+            return subprocess.CompletedProcess(argv, 0, trace, "")
+
+        buf = io.StringIO()
+        with mock.patch.object(mod.subprocess, "run", side_effect=fake), \
+             mock.patch.object(mod, "WARP_CHECK_FILE",
+                               pathlib.Path(self.tmp.name) / "warp-check.json"), \
+             mock.patch.object(mod.sys, "stdout", buf):
+            mod.cmd_warp_check()
+
+        curl = [call for call in calls if call[0] == "curl"][0]
+        self.assertIn("-x", curl)
+        self.assertIn("http://127.0.0.1:%d" % mod.WARP_MIXED_PORT, curl)
+        result = json.loads(buf.getvalue())["check"]
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["colo"], "DME")
+        # The tunnel works and the kernel really sends traffic through it.
+        self.assertTrue(result["tun"])
+
+    def test_warp_check_reports_a_route_that_bypasses_the_tunnel(self):
+        from unittest import mock
+        mod = self.mod
+        trace = "ip=104.28.0.1\nwarp=on\ncolo=DME\n"
+
+        def fake(argv, **kwargs):
+            if argv[:2] == ["ip", "route"]:
+                return subprocess.CompletedProcess(argv, 0, "1.1.1.1 dev enp8s0 src 192.168.0.5\n", "")
+            return subprocess.CompletedProcess(argv, 0, trace, "")
+
+        buf = io.StringIO()
+        with mock.patch.object(mod.subprocess, "run", side_effect=fake), \
+             mock.patch.object(mod, "WARP_CHECK_FILE",
+                               pathlib.Path(self.tmp.name) / "warp-check.json"), \
+             mock.patch.object(mod.sys, "stdout", buf):
+            mod.cmd_warp_check()
+        result = json.loads(buf.getvalue())["check"]
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["tun"])
+
+    def test_warp_unit_validates_the_config_before_start(self):
+        text = self.mod.WARP_UNIT_TEMPLATE.format(user="u", group="g", home="/home/u")
+        lines = text.splitlines()
+        pre = [i for i, line in enumerate(lines) if line.startswith("ExecStartPre=")]
+        start = [i for i, line in enumerate(lines) if line.startswith("ExecStart=")]
+        self.assertTrue(pre, "WARP unit must validate the generated YAML")
+        self.assertIn(" -t ", lines[pre[0]])
+        self.assertLess(pre[0], start[0])
+
 
     def test_missing_account_is_rejected(self):
         with self.assertRaises(self.mod.Fail):
@@ -208,12 +334,14 @@ class WarpTest(unittest.TestCase):
         _, gateway = self.mod.warp_keys()
         account = dict(self.ACCOUNT, private_key=private_key, public_key=public_key,
                        endpoint_pub_key=gateway)
-        with tempfile.TemporaryDirectory() as tmp:
-            config = pathlib.Path(tmp) / "warp.yaml"
-            config.write_text(self.mod.warp_config_text(account), encoding="utf-8")
-            cp = subprocess.run([binary, "-t", "-f", str(config), "-d", tmp],
-                                capture_output=True, text=True, timeout=60)
-            self.assertEqual(cp.returncode, 0, cp.stdout + cp.stderr)
+        # mihomo only accepts rule-provider paths under $HOME or its own data
+        # directory, so the config and the lists share the sandbox here.
+        tmp = self.tmp.name
+        config = pathlib.Path(tmp) / "warp.yaml"
+        config.write_text(self.mod.warp_config_text(account), encoding="utf-8")
+        cp = subprocess.run([binary, "-t", "-f", str(config), "-d", tmp],
+                            capture_output=True, text=True, timeout=60)
+        self.assertEqual(cp.returncode, 0, cp.stdout + cp.stderr)
 
     def test_nft_skips_warp_endpoints(self):
         script = self.mod.NFT_SCRIPT.format(
@@ -278,6 +406,58 @@ class SetupRestartTest(unittest.TestCase):
              mock.patch.object(self.mod, "warp_unit_state", lambda: ("inactive", "")):
             self.mod.restart_services(False)
         self.assertEqual(calls, [])
+
+
+class WarpConfigRefreshTest(unittest.TestCase):
+    """An update must not leave the old template's config behind."""
+
+    def setUp(self):
+        self.mod = load()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        home = pathlib.Path(self.tmp.name)
+        (home / ".config" / "kich-dpi").mkdir(parents=True)
+        (home / ".local" / "share" / "kich-dpi").mkdir(parents=True)
+        self.home = home
+        self.config = home / ".config" / "kich-dpi" / "warp.yaml"
+        self.account = home / ".local" / "share" / "kich-dpi" / "account.json"
+        self.user = SimpleNamespace(pw_name="kich", pw_dir=str(home))
+
+    def test_does_nothing_when_warp_is_not_in_use(self):
+        from unittest import mock
+        calls = []
+        with mock.patch.object(self.mod.subprocess, "run",
+                               side_effect=lambda *a, **k: calls.append(a)):
+            self.assertEqual(self.mod.refresh_warp_config(self.user), "")
+        self.assertEqual(calls, [])
+
+    def test_renders_as_the_owner_of_home(self):
+        from unittest import mock
+        self.config.write_text("mixed-port: 0\n", encoding="utf-8")
+        self.account.write_text("{}", encoding="utf-8")
+        argv = []
+
+        def fake(args, **kwargs):
+            argv.extend(args)
+            return subprocess.CompletedProcess(args, 0, "{}", "")
+
+        with mock.patch.object(self.mod.subprocess, "run", side_effect=fake):
+            self.assertEqual(self.mod.refresh_warp_config(self.user), "")
+        self.assertEqual(argv[:3], ["runuser", "-u", "kich"])
+        self.assertIn("HOME=%s" % self.home, argv)
+        self.assertEqual(argv[-1], "warp-config")
+        # The freshly installed copy, not the repo checkout.
+        self.assertEqual(argv[-2], str(self.mod.APP_DIR / "bin" / "kich-dpi"))
+
+    def test_reports_a_failed_render_without_failing_the_update(self):
+        from unittest import mock
+        self.config.write_text("mixed-port: 0\n", encoding="utf-8")
+        self.account.write_text("{}", encoding="utf-8")
+        with mock.patch.object(self.mod.subprocess, "run",
+                               return_value=subprocess.CompletedProcess(
+                                   ["runuser"], 1, "", "нет списков правил")):
+            note = self.mod.refresh_warp_config(self.user)
+        self.assertIn("нет списков правил", note) 
 
 
 class StateTest(unittest.TestCase):

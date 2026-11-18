@@ -79,8 +79,10 @@ Panel {
     if (!warpAvailable) return "mihomo не установлен — нажмите, чтобы доустановить"
     if (warpConflict !== "") return "Недоступен: " + warpConflict
     if (warpRunning) {
-      if (warpCheckText !== "")
-        return "Выход " + warpCheckText + (warpCheck.colo ? " · " + warpCheck.colo : "")
+      if (warpCheckText !== "") {
+        var route = warpCheck.tun === false ? " · маршрут не в туннеле" : ""
+        return "Выход " + warpCheckText + (warpCheck.colo ? " · " + warpCheck.colo : "") + route
+      }
       return "Туннель включён"
     }
     if (warp.failed === true) return "Служба не запустилась — смотрите журнал"

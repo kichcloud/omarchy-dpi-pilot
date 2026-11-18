@@ -34,7 +34,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-VERSION = "0.2.4"
+VERSION = "0.3.0"
 
 UNIT = "kich-dpi.service"
 TABLE = "kich_dpi"
@@ -76,6 +76,26 @@ WARP_CONFIG = CONFIG_DIR / "warp.yaml"
 WARP_DATA = HOME / ".local" / "share" / ENGINE_SLUG
 WARP_ACCOUNT = WARP_DATA / "account.json"
 WARP_CHECK_FILE = STATE_DIR / "warp-check.json"
+WARP_DEVICE = "kichwarp"
+# Local HTTP proxy mihomo opens next to the TUN. Diagnostics go through it so
+# they test the tunnel itself instead of whatever the system routes do.
+WARP_MIXED_PORT = 17890
+# Lists ship with the app; the user's own entries live next to the config.
+BUNDLED_RULES = APP_DIR / "data" / "rules"
+# mihomo validates every rule-provider path against its `-d` data directory
+# (the unit passes ~/.local/state/kich-dpi) and refuses anything outside it, so
+# the shipped lists are copied there instead of living next to the config.
+WARP_RULES = STATE_DIR / "rules"
+WARP_USER_DOMAINS = CONFIG_DIR / "direct-domains.txt"
+WARP_USER_PROCESSES = CONFIG_DIR / "direct-processes.txt"
+WARP_USER_DOMAINS_HEADER = """# Domains that always go direct, one per line (`#` starts a comment).
+# Applied by `kich-dpi warp-on`; this file is never rewritten.
+"""
+WARP_USER_PROCESSES_HEADER = """# Applications that always go direct, one per line, matched against the
+# process name (`ps -o comm=`). Applied by `kich-dpi warp-on`; this file is
+# never rewritten. Matching makes mihomo track process owners, so keep it
+# empty unless you actually need it.
+"""
 CF_ORIGIN = "https://api.cloudflareclient.com"
 CF_VERSION = "v0a4471"
 CF_HEADERS = {
@@ -103,19 +123,6 @@ WARP_SNI = "speed.cloudflare.com"
 # the DPI mark pinned to the main table (see `fw_rule`) the skip is gone, so RU
 # traffic that mihomo dials DIRECT keeps its bypass while WARP is up.
 WARP_MARK = "0x20000000"
-WARP_DIRECT = (
-    # Russian services that must not leave the country through the tunnel.
-    "yandex.ru", "ya.ru", "yandex.net", "yandexcloud.net", "kinopoisk.ru",
-    "vk.com", "vk.ru", "userapi.com", "ok.ru", "mail.ru", "max.ru",
-    "gosuslugi.ru", "mos.ru", "nalog.gov.ru", "nalog.ru", "mosreg.ru",
-    "sberbank.ru", "sber.ru", "sbol.ru", "tinkoff.ru", "tbank.ru",
-    "vtb.ru", "alfabank.ru", "gazprombank.ru", "psbank.ru", "mkb.ru",
-    "raiffeisen.ru", "rshb.ru", "open.ru", "rosselhozbank.ru",
-    "wildberries.ru", "ozon.ru", "avito.ru", "dns-shop.ru", "2gis.ru",
-    "rutube.ru", "dzen.ru", "mts.ru", "beeline.ru", "megafon.ru",
-    "tele2.ru", "rt.ru", "pochta.ru", "rzd.ru", "aeroflot.ru", "s7.ru",
-)
-
 
 
 class Fail(Exception):
@@ -697,6 +704,9 @@ User={user}
 Group={group}
 Environment=HOME={home}
 WorkingDirectory={home}/.local/state/kich-dpi
+# A broken config must fail the start. Without this mihomo comes up with the
+# old file (or not at all) and traffic silently leaves outside the tunnel.
+ExecStartPre=/opt/kich-dpi/mihomo -t -f {home}/.config/kich-dpi/warp.yaml -d {home}/.local/state/kich-dpi
 ExecStart=/opt/kich-dpi/mihomo -f {home}/.config/kich-dpi/warp.yaml -d {home}/.local/state/kich-dpi
 Restart=on-failure
 RestartSec=3
@@ -734,6 +744,13 @@ def install_app():
     if src != dest:
         shutil.copy2(src, dest)
     os.chmod(dest, 0o755)
+    # Bundled rule lists travel with the app: they stay root-owned and read-only
+    # for the user, and `warp-on` copies them into mihomo's data directory.
+    data_src = src.parent.parent / "data"
+    data_dest = APP_DIR / "data"
+    if data_src.is_dir() and data_src.resolve() != data_dest.resolve():
+        shutil.rmtree(data_dest, ignore_errors=True)
+        shutil.copytree(data_src, data_dest)
 
 
 def install_system(user):
@@ -779,6 +796,33 @@ def restart_services(was_running):
         warp_systemctl("restart", timeout=30)
 
 
+def refresh_warp_config(user):
+    """Re-render the WARP config as the target user, right after an update.
+
+    Config and rule lists belong to the user, so root must not write them and
+    leave root-owned files behind: run the freshly installed app as the owner
+    of those paths. Best effort — toggling WARP by hand also works.
+    """
+    home = Path(user.pw_dir)
+    config = home / ".config" / ENGINE_SLUG / "warp.yaml"
+    account = home / ".local" / "share" / ENGINE_SLUG / "account.json"
+    if not config.is_file() or not account.is_file():
+        return ""
+    try:
+        cp = subprocess.run(
+            ["runuser", "-u", user.pw_name, "--", "env",
+             "HOME=%s" % user.pw_dir, "USER=%s" % user.pw_name,
+             "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+             str(APP_DIR / "bin" / "kich-dpi"), "warp-config"],
+            capture_output=True, text=True, timeout=90,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return str(exc)[:200]
+    if cp.returncode != 0:
+        return (cp.stderr or cp.stdout).strip()[-200:]
+    return ""
+
+
 def cmd_setup(archive_arg=""):
     require_root()
     user = target_user()
@@ -802,9 +846,11 @@ def cmd_setup(archive_arg=""):
                 # The app on disk is new, the running services still execute
                 # the old copy: restart them here too, otherwise an update made
                 # while GitHub rate-limits us looks like it did nothing.
+                config_note = refresh_warp_config(user)
                 restart_services(was_running)
                 out({"ok": True, "version": previous, "previous": previous,
                      "note": "сеть недоступна, системная часть обновлена без движка",
+                     "warp_config": config_note,
                      "detail": str(exc)[:200]})
                 return
             raise Fail("не удалось получить релиз zapret2: %s" % exc)
@@ -849,11 +895,13 @@ def cmd_setup(archive_arg=""):
     except Fail as exc:
         warp_note = str(exc)[:200]
 
+    config_note = refresh_warp_config(user)
     restart_services(was_running)
 
     out({"ok": True, "version": tag, "previous": previous,
          "user": user.pw_name, "installed": int(time.time()),
-         "warp": not bool(warp_note), "warp_note": warp_note})
+         "warp": not bool(warp_note), "warp_note": warp_note,
+         "warp_config": config_note})
 
 
 def cmd_remove(purge=False):
@@ -1108,6 +1156,16 @@ def yaml_str(value):
     return json.dumps(str(value), ensure_ascii=False)
 
 
+def list_lines(path):
+    """Entries of a plain-text list: one per line, `#` comments allowed."""
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except OSError:
+        return []
+    return [line.strip() for line in text.splitlines()
+            if line.strip() and not line.lstrip().startswith("#")]
+
+
 def warp_config_text(account):
     if not account:
         raise Fail("аккаунт WARP не зарегистрирован")
@@ -1117,19 +1175,29 @@ def warp_config_text(account):
         raise Fail("в аккаунте нет ключа MASQUE-шлюза")
     ip4 = cidr_of(account.get("ipv4"), 4)
     ip6 = cidr_of(account.get("ipv6"), 6)
+    own_domains = list_lines(WARP_USER_DOMAINS)
+    processes = list_lines(WARP_USER_PROCESSES)
+    for name in processes:
+        if "," in name:
+            raise Fail("в direct-processes.txt недопустима запятая: %s" % name)
 
     lines = []
     add = lines.append
     add("# Generated by kich-dpi. Do not edit: change the plugin instead.")
     add("# WARP over MASQUE (HTTP/2) · account %s" % str(account.get("id") or "")[:8])
-    add("mixed-port: 0")
+    # Local proxy for diagnostics: `warp-check` dials the tunnel through it
+    # instead of relying on whatever the system routing table currently says.
+    add("mixed-port: %d" % WARP_MIXED_PORT)
+    add("bind-address: 127.0.0.1")
     add("allow-lan: false")
     add("mode: rule")
     add("log-level: warning")
     # WARP carries IPv6 over the same tunnel; the host does not need a
     # global v6 address for this to work.
     add("ipv6: true")
-    add("find-process-mode: \"off\"")
+    # PROCESS-NAME needs mihomo to resolve the owner of every connection, which
+    # costs more than it is worth while no process rules exist.
+    add("find-process-mode: %s" % ('"strict"' if processes else '"off"'))
     # Identifies the sockets mihomo opens itself; DPI now handles them like any
     # other traffic instead of skipping the mark.
     add("routing-mark: %s" % WARP_MARK)
@@ -1146,7 +1214,7 @@ def warp_config_text(account):
     add("tun:")
     add("  enable: true")
     add("  stack: gvisor")
-    add("  device: kichwarp")
+    add("  device: %s" % WARP_DEVICE)
     add("  auto-route: true")
     add("  auto-detect-interface: true")
     add("  auto-redirect: false")
@@ -1208,9 +1276,31 @@ def warp_config_text(account):
     add("    remote-dns-resolve: true")
     add("    dns: [\"https://1.1.1.1/dns-query\"]")
     add("    handshake-timeout: 20")
+    add("rule-providers:")
+    for name, behavior, path in (
+            ("ru-domain", "domain", WARP_RULES / "ru-domain.txt"),
+            ("ru-ip", "ipcidr", WARP_RULES / "ru-ip.txt")):
+        add("  %s:" % name)
+        add("    type: file")
+        add("    behavior: %s" % behavior)
+        add("    format: text")
+        add("    path: %s" % yaml_str(path))
+    if own_domains:
+        add("  direct-domains:")
+        add("    type: file")
+        add("    behavior: domain")
+        add("    format: text")
+        add("    path: %s" % yaml_str(WARP_USER_DOMAINS))
     add("rules:")
-    for domain in WARP_DIRECT:
-        add("  - DOMAIN-SUFFIX,%s,DIRECT" % domain)
+    # A process rule wins over everything else: that is the point of listing it.
+    for name in processes:
+        add("  - PROCESS-NAME,%s,DIRECT" % name)
+    add("  - RULE-SET,ru-domain,DIRECT")
+    # The tunnel is pointless for hosts inside Russia. `no-resolve` keeps the
+    # lookup off the fake-IP path: domains are already covered above.
+    add("  - RULE-SET,ru-ip,DIRECT,no-resolve")
+    if own_domains:
+        add("  - RULE-SET,direct-domains,DIRECT")
     for domain in ("lan", "local", "home.arpa"):
         add("  - DOMAIN-SUFFIX,%s,DIRECT" % domain)
     for address in ("192.168.0.0/16", "10.0.0.0/8", "172.16.0.0/12", "127.0.0.0/8",
@@ -1225,10 +1315,35 @@ def warp_config_text(account):
     return "\n".join(lines)
 
 
+def install_rule_lists():
+    """Copy the shipped lists where mihomo is allowed to read them."""
+    missing = []
+    WARP_RULES.mkdir(parents=True, exist_ok=True)
+    for name in ("ru-domain.txt", "ru-ip.txt"):
+        src = BUNDLED_RULES / name
+        if not src.is_file():
+            missing.append(name)
+            continue
+        write_text(WARP_RULES / name, src.read_text(encoding="utf-8"), 0o644)
+    if missing:
+        raise Fail("нет списков правил (%s): обновите системную часть плагина"
+                   % ", ".join(missing))
+
+
+def ensure_user_lists():
+    """Create the user's own direct lists once; never touch them again."""
+    for path, header in ((WARP_USER_DOMAINS, WARP_USER_DOMAINS_HEADER),
+                         (WARP_USER_PROCESSES, WARP_USER_PROCESSES_HEADER)):
+        if not path.exists():
+            write_text(path, header, 0o644)
+
+
 def warp_build(account=None):
     account = account or warp_account()
     if not account:
         raise Fail("WARP ещё не зарегистрирован")
+    install_rule_lists()
+    ensure_user_lists()
     text = warp_config_text(account)
     write_text(WARP_CONFIG, text, 0o600)
     return WARP_CONFIG
@@ -1278,6 +1393,15 @@ def warp_status():
     }
 
 
+def cmd_warp_config():
+    """Rewrite the generated config from the current template."""
+    account = warp_account()
+    if not account:
+        raise Fail("WARP не зарегистрирован")
+    path = warp_build(account)
+    out({"ok": True, "config": str(path)})
+
+
 def cmd_warp_on():
     conflict = warp_conflict()
     if conflict:
@@ -1325,18 +1449,39 @@ def cmd_warp_register():
          "account": str(account.get("id") or "")[:8]})
 
 
+def route_device():
+    """Device the kernel picks for ordinary outbound traffic."""
+    try:
+        cp = subprocess.run(["ip", "route", "get", "1.1.1.1"],
+                            capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    parts = cp.stdout.split()
+    if "dev" in parts:
+        index = parts.index("dev") + 1
+        if index < len(parts):
+            return parts[index]
+    return ""
+
+
 def cmd_warp_check():
     started = time.monotonic()
     result = {"time": int(time.time()), "ok": False, "warp": "", "ip": "", "colo": "",
-              "ms": 0, "error": ""}
+              "ms": 0, "error": "", "tun": False}
     try:
+        # Through mihomo's own proxy port: this asks the tunnel whether it works
+        # instead of asking the routing table where packets happen to go. The
+        # route is reported separately, because a working tunnel with a broken
+        # route is exactly the failure that used to look like success.
         cp = subprocess.run(
             ["curl", "-fsS", "--max-time", "10",
+             "-x", "http://127.0.0.1:%d" % WARP_MIXED_PORT,
              "https://www.cloudflare.com/cdn-cgi/trace"],
             capture_output=True, text=True, timeout=15,
         )
         if cp.returncode != 0:
-            result["error"] = (cp.stderr or "нет ответа").strip()[:200]
+            result["error"] = ("туннель не отвечает: "
+                               + (cp.stderr or "нет ответа").strip())[:200]
         else:
             values = {}
             for line in cp.stdout.splitlines():
@@ -1351,6 +1496,7 @@ def cmd_warp_check():
                 result["error"] = "трафик не идёт через WARP"
     except (OSError, subprocess.SubprocessError) as exc:
         result["error"] = str(exc)[:200]
+    result["tun"] = route_device() == WARP_DEVICE
     result["ms"] = int((time.monotonic() - started) * 1000)
     write_json(WARP_CHECK_FILE, result)
     out({"ok": True, "check": result})
@@ -1844,7 +1990,8 @@ def main(argv):
             "WARP (MASQUE, необязательно):\n"
             "  warp-on | warp-off | warp-toggle\n"
             "  warp-register          перерегистрировать аккаунт Cloudflare\n"
-            "  warp-check             проверить, идёт ли трафик через WARP\n")
+            "  warp-check             проверить, идёт ли трафик через WARP\n"
+            "  warp-config            пересобрать конфиг из текущего шаблона\n")
         return 0
 
     cmd = argv[1]
@@ -1893,6 +2040,8 @@ def main(argv):
             cmd_warp_register()
         elif cmd == "warp-check":
             cmd_warp_check()
+        elif cmd == "warp-config":
+            cmd_warp_config()
         else:
             raise Fail("неизвестная команда: %s" % cmd)
     except Fail as exc:

@@ -1,0 +1,51 @@
+# Russian services that must not leave the country through the tunnel.
+# One domain suffix per line; `#` starts a comment. Loaded as a mihomo
+# rule-provider (`behavior: domain`), so `example.ru` also matches
+# `www.example.ru`. Add your own domains to ~/.config/kich-dpi/direct-domains.txt
+# instead of editing this file: it is replaced when the plugin updates.
+yandex.ru
+ya.ru
+yandex.net
+yandexcloud.net
+kinopoisk.ru
+vk.com
+vk.ru
+userapi.com
+ok.ru
+mail.ru
+max.ru
+gosuslugi.ru
+mos.ru
+nalog.gov.ru
+nalog.ru
+mosreg.ru
+sberbank.ru
+sber.ru
+sbol.ru
+tinkoff.ru
+tbank.ru
+vtb.ru
+alfabank.ru
+gazprombank.ru
+psbank.ru
+mkb.ru
+raiffeisen.ru
+rshb.ru
+open.ru
+rosselhozbank.ru
+wildberries.ru
+ozon.ru
+avito.ru
+dns-shop.ru
+2gis.ru
+rutube.ru
+dzen.ru
+mts.ru
+beeline.ru
+megafon.ru
+tele2.ru
+rt.ru
+pochta.ru
+rzd.ru
+aeroflot.ru
+s7.ru
