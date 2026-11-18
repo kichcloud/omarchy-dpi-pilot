@@ -11,14 +11,18 @@ Run `kich-dpi --help` for the command list.
 
 from __future__ import annotations
 
+import base64
 import fcntl
+import gzip
 import grp
 import hashlib
+import ipaddress
 import json
 import os
 import platform
 import pwd
 import re
+import secrets
 import shutil
 import signal
 import subprocess
@@ -26,10 +30,11 @@ import sys
 import tarfile
 import tempfile
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 
 UNIT = "kich-dpi.service"
 TABLE = "kich_dpi"
@@ -58,6 +63,40 @@ ACTIVE_FILE = CONFIG_DIR / "active.json"
 STRATEGIES_FILE = CONFIG_DIR / "strategies.json"
 CHECK_FILE = STATE_DIR / "check.json"
 PROGRESS_FILE = STATE_DIR / "progress.json"
+
+# WARP (MASQUE) is an optional second engine. It is deliberately separate from
+# the DPI path: mihomo owns the tunnel and its config is generated locally.
+WARP_UNIT = "kich-dpi-warp.service"
+WARP_UNIT_PATH = Path("/etc/systemd/system") / WARP_UNIT
+MIHOMO = ENGINE_ROOT / "mihomo"
+WARP_CONFIG = CONFIG_DIR / "warp.yaml"
+WARP_DATA = HOME / ".local" / "share" / ENGINE_SLUG
+WARP_ACCOUNT = WARP_DATA / "account.json"
+WARP_CHECK_FILE = STATE_DIR / "warp-check.json"
+CF_ORIGIN = "https://api.cloudflareclient.com"
+CF_VERSION = "v0a4471"
+CF_HEADERS = {
+    "User-Agent": "WARP for Android",
+    "CF-Client-Version": "a-6.35-4471",
+    "Content-Type": "application/json; charset=UTF-8",
+    "Accept": "application/json",
+    "Accept-Encoding": "identity",
+}
+WARP_ENDPOINTS = ("162.159.198.2", "162.159.198.1", "162.159.199.2", "162.159.199.1")
+WARP_SNI = "speed.cloudflare.com"
+WARP_DIRECT = (
+    # Russian services that must not leave the country through the tunnel.
+    "yandex.ru", "ya.ru", "yandex.net", "yandexcloud.net", "kinopoisk.ru",
+    "vk.com", "vk.ru", "userapi.com", "ok.ru", "mail.ru", "max.ru",
+    "gosuslugi.ru", "mos.ru", "nalog.gov.ru", "nalog.ru", "mosreg.ru",
+    "sberbank.ru", "sber.ru", "sbol.ru", "tinkoff.ru", "tbank.ru",
+    "vtb.ru", "alfabank.ru", "gazprombank.ru", "psbank.ru", "mkb.ru",
+    "raiffeisen.ru", "rshb.ru", "open.ru", "rosselhozbank.ru",
+    "wildberries.ru", "ozon.ru", "avito.ru", "dns-shop.ru", "2gis.ru",
+    "rutube.ru", "dzen.ru", "mts.ru", "beeline.ru", "megafon.ru",
+    "tele2.ru", "rt.ru", "pochta.ru", "rzd.ru", "aeroflot.ru", "s7.ru",
+)
+
 
 
 class Fail(Exception):
@@ -455,6 +494,113 @@ def extract_engine(archive, tag):
     return target
 
 
+def github_latest_tag(repo):
+    """Resolve the latest release tag without the API (which is rate limited)."""
+    url = "https://github.com/%s/releases/latest" % repo
+    req = urllib.request.Request(url, headers={"User-Agent": "kich-dpi/%s" % VERSION})
+    try:
+        with urllib.request.urlopen(req, timeout=25) as resp:
+            final = resp.geturl()
+    except urllib.error.HTTPError as exc:
+        raise Fail("GitHub ответил HTTP %s" % exc.code)
+    except urllib.error.URLError as exc:
+        raise Fail("нет связи с GitHub: %s" % exc.reason)
+    tag = final.rstrip("/").rsplit("/", 1)[-1]
+    if not tag.startswith("v"):
+        raise Fail("не удалось определить версию релиза")
+    return tag
+
+
+def mihomo_release():
+    arch = {"x86_64": "amd64", "arm64": "arm64"}.get(machine_arch())
+    if not arch:
+        raise Fail("нет сборки mihomo для архитектуры %s" % machine_arch())
+    tag = ""
+    digest = ""
+    try:
+        req = urllib.request.Request(
+            "https://api.github.com/repos/MetaCubeX/mihomo/releases/latest",
+            headers={"User-Agent": "kich-dpi/%s" % VERSION, "Accept": "application/vnd.github+json"},
+        )
+        with urllib.request.urlopen(req, timeout=25) as resp:
+            data = json.load(resp)
+        tag = str(data.get("tag_name") or "")
+        assets = {str(asset.get("name")): asset for asset in data.get("assets") or []}
+        for name in ("mihomo-linux-%s-compatible-%s.gz" % (arch, tag),
+                     "mihomo-linux-%s-%s.gz" % (arch, tag)):
+            asset = assets.get(name)
+            if asset:
+                return tag, str(asset.get("browser_download_url") or ""), \
+                    str(asset.get("digest") or "")
+    except Exception:
+        pass  # fall through to the redirect-based resolution below
+    if not tag:
+        tag = github_latest_tag("MetaCubeX/mihomo")
+    for name in ("mihomo-linux-%s-compatible-%s.gz" % (arch, tag),
+                 "mihomo-linux-%s-%s.gz" % (arch, tag)):
+        url = "https://github.com/MetaCubeX/mihomo/releases/download/%s/%s" % (tag, name)
+        if remote_exists(url):
+            return tag, url, digest
+    raise Fail("не удалось найти сборку mihomo %s для %s" % (tag, arch))
+
+
+def remote_exists(url):
+    req = urllib.request.Request(url, method="HEAD",
+                                 headers={"User-Agent": "kich-dpi/%s" % VERSION})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            return resp.status == 200
+    except Exception:
+        return False
+
+
+def install_mihomo():
+    """Download mihomo next to the DPI engine. Root only; called from setup."""
+    if warp_available():
+        return mihomo_version()
+    local = os.environ.get("KICH_DPI_MIHOMO_ARCHIVE")
+    if local:
+        tag, url, digest = "custom", "", ""
+        source = Path(local)
+        if not source.exists():
+            raise Fail("архив mihomo не найден: %s" % local)
+    else:
+        tag, url, digest = mihomo_release()
+    with tempfile.TemporaryDirectory(prefix="kich-dpi-mihomo-") as tmp:
+        archive = Path(tmp) / "mihomo.gz"
+        if local:
+            shutil.copy2(source, archive)
+        else:
+            try:
+                download(url, archive)
+            except Exception as exc:
+                raise Fail("не удалось скачать mihomo: %s" % exc)
+        if digest.startswith("sha256:"):
+            actual = "sha256:" + sha256_file(archive)
+            if actual.lower() != digest.lower():
+                raise Fail("sha256 mihomo не совпал")
+        target = MIHOMO.with_name(".mihomo.new")
+        try:
+            with gzip.open(archive, "rb") as src, open(target, "wb") as dst:
+                shutil.copyfileobj(src, dst, 1024 * 256)
+        except (OSError, gzip.BadGzipFile) as exc:
+            raise Fail("повреждён архив mihomo: %s" % exc)
+        os.chmod(target, 0o755)
+        check = subprocess.run([str(target), "-v"], capture_output=True, text=True, timeout=20)
+        if check.returncode != 0:
+            target.unlink(missing_ok=True)
+            raise Fail("скачанный mihomo не запускается")
+        os.replace(target, MIHOMO)
+    write_json(ENGINE_ROOT / "mihomo.json", {"version": tag, "installed": int(time.time()),
+                                             "sha256": digest})
+    return tag
+
+
+def mihomo_version():
+    info = read_json(ENGINE_ROOT / "mihomo.json", {})
+    return str(info.get("version") or "") if isinstance(info, dict) else ""
+
+
 def write_text(path, text, mode=0o644):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -508,13 +654,57 @@ LimitNOFILE=65535
 WantedBy=multi-user.target
 """
 
-POLKIT_TEMPLATE = """// Installed by kich-dpi. Allows the session user to start and stop the bypass.
+POLKIT_TEMPLATE = """// Installed by kich-dpi. Allows the session user to start and stop the bypass
+// and the optional WARP tunnel without a password.
 polkit.addRule(function(action, subject) {{
   if (action.id !== "org.freedesktop.systemd1.manage-units") return;
   if (subject.user !== "{user}") return;
   var unit = action.lookup("unit");
-  if (unit === "{unit}") return polkit.Result.YES;
+  if (unit === "{unit}" || unit === "{warp_unit}") return polkit.Result.YES;
 }});
+"""
+
+WARP_UNIT_TEMPLATE = """# Installed by kich-dpi (Omarchy plugin). Removed by `kich-dpi remove`.
+[Unit]
+Description=WARP MASQUE tunnel for Omarchy (kich-dpi)
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/opt/kich-dpi/mihomo
+ConditionPathExists={home}/.config/kich-dpi/warp.yaml
+
+[Service]
+Type=simple
+User={user}
+Group={group}
+Environment=HOME={home}
+WorkingDirectory={home}/.local/state/kich-dpi
+ExecStart=/opt/kich-dpi/mihomo -f {home}/.config/kich-dpi/warp.yaml -d {home}/.local/state/kich-dpi
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=10
+NoNewPrivileges=yes
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+PrivateDevices=no
+DeviceAllow=/dev/net/tun rw
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=-{home}/.config/kich-dpi -{home}/.local/state/kich-dpi
+PrivateTmp=yes
+ProtectKernelTunables=no
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
 """
 
 
@@ -532,12 +722,27 @@ def install_system(user):
         group = grp.getgrgid(user.pw_gid).gr_name
     except KeyError:
         group = user.pw_name
+    home = Path(user.pw_dir)
     write_text(UNIT_PATH, UNIT_TEMPLATE.format(
         user=user.pw_name, group=group, home=user.pw_dir,
     ))
-    write_text(POLKIT_PATH, POLKIT_TEMPLATE.format(user=user.pw_name, unit=UNIT))
+    write_text(WARP_UNIT_PATH, WARP_UNIT_TEMPLATE.format(
+        user=user.pw_name, group=group, home=user.pw_dir,
+    ))
+    write_text(POLKIT_PATH, POLKIT_TEMPLATE.format(
+        user=user.pw_name, unit=UNIT, warp_unit=WARP_UNIT,
+    ))
     write_text(SYSCTL_PATH, "net.netfilter.nf_conntrack_tcp_be_liberal=1\n")
     subprocess.run(["systemctl", "daemon-reload"], capture_output=True, text=True)
+    for unit in (UNIT, WARP_UNIT):
+        subprocess.run(["systemctl", "enable", unit], capture_output=True, text=True)
+    for folder in (home / ".config" / ENGINE_SLUG, home / ".local" / "state" / ENGINE_SLUG,
+                   home / ".local" / "share" / ENGINE_SLUG):
+        folder.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chown(folder, user.pw_uid, user.pw_gid)
+        except OSError:
+            pass
     try:
         subprocess.run(
             ["sysctl", "-q", "-w", "net.netfilter.nf_conntrack_tcp_be_liberal=1"],
@@ -607,18 +812,29 @@ def cmd_setup(archive_arg=""):
     install_app()
     install_system(user)
 
+    warp_note = ""
+    warp_active = warp_unit_state()[0] == "active"
+    try:
+        install_mihomo()
+    except Fail as exc:
+        warp_note = str(exc)[:200]
+
     if was_running:
         systemctl("restart", timeout=30)
+    if warp_active:
+        warp_systemctl("restart", timeout=30)
 
     out({"ok": True, "version": tag, "previous": previous,
-         "user": user.pw_name, "installed": int(time.time())})
+         "user": user.pw_name, "installed": int(time.time()),
+         "warp": not bool(warp_note), "warp_note": warp_note})
 
 
 def cmd_remove(purge=False):
     require_root()
     user = target_user()
-    subprocess.run(["systemctl", "disable", "--now", UNIT], capture_output=True, text=True)
-    for path in (UNIT_PATH, POLKIT_PATH, SYSCTL_PATH):
+    for unit in (WARP_UNIT, UNIT):
+        subprocess.run(["systemctl", "disable", "--now", unit], capture_output=True, text=True)
+    for path in (UNIT_PATH, WARP_UNIT_PATH, POLKIT_PATH, SYSCTL_PATH):
         try:
             path.unlink()
         except OSError:
@@ -628,10 +844,449 @@ def cmd_remove(purge=False):
         shutil.rmtree(ENGINE_ROOT)
     if purge:
         home = Path(user.pw_dir)
-        for path in (home / ".config" / ENGINE_SLUG, home / ".local" / "state" / ENGINE_SLUG):
+        for path in (home / ".config" / ENGINE_SLUG, home / ".local" / "state" / ENGINE_SLUG,
+                     home / ".local" / "share" / ENGINE_SLUG):
             if path.exists():
                 shutil.rmtree(path)
     out({"ok": True, "removed": True, "purged": bool(purge)})
+
+
+# --------------------------------------------------------------------- warp
+
+def warp_available():
+    return MIHOMO.is_file() and os.access(MIHOMO, os.X_OK)
+
+
+def warp_systemctl(*args, timeout=25):
+    try:
+        return subprocess.run(
+            ["systemctl", *args, WARP_UNIT],
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return subprocess.CompletedProcess(["systemctl", *args, WARP_UNIT], 1, "", str(exc))
+
+
+def warp_unit_state():
+    if not WARP_UNIT_PATH.exists():
+        return "inactive", "not-found"
+    active = warp_systemctl("is-active").stdout.strip() or "inactive"
+    enabled = warp_systemctl("is-enabled").stdout.strip() or "disabled"
+    return active, enabled
+
+
+def warp_account():
+    data = read_json(WARP_ACCOUNT, {})
+    if not isinstance(data, dict):
+        return {}
+    needed = ("private_key", "endpoint_pub_key", "id", "access_token")
+    if any(not str(data.get(key) or "").strip() for key in needed):
+        return {}
+    return data
+
+
+def save_warp_account(account):
+    WARP_DATA.mkdir(parents=True, exist_ok=True)
+    os.chmod(WARP_DATA, 0o700)
+    tmp = WARP_ACCOUNT.with_name("." + WARP_ACCOUNT.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(account, fh, ensure_ascii=False, indent=1)
+        fh.write("\n")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, WARP_ACCOUNT)
+
+
+def cf_request(path, payload, token="", method="POST"):
+    req = urllib.request.Request(
+        CF_ORIGIN + "/" + CF_VERSION + path,
+        data=json.dumps(payload).encode("utf-8"),
+        headers=dict(CF_HEADERS),
+        method=method,
+    )
+    if token:
+        req.add_header("Authorization", "Bearer " + token)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            raw = resp.read().decode("utf-8", "replace")
+            return json.loads(raw or "{}")
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", "replace")
+        message = raw
+        try:
+            body = json.loads(raw)
+            message = body.get("message") or body.get("error") or raw
+        except ValueError:
+            pass
+        if exc.code == 429 or "1015" in raw:
+            raise Fail("Cloudflare временно ограничил регистрацию, повторите позже")
+        if exc.code in (401, 403):
+            raise Fail("Cloudflare отклонил аккаунт — нужна повторная регистрация")
+        raise Fail("Cloudflare API: HTTP %s: %s" % (exc.code, str(message)[:200]))
+    except urllib.error.URLError as exc:
+        raise Fail("нет связи с Cloudflare: %s" % exc.reason)
+
+
+def warp_keys():
+    openssl = shutil.which("openssl")
+    if not openssl:
+        raise Fail("для ключей WARP нужен openssl")
+    with tempfile.TemporaryDirectory(prefix="kich-dpi-warp-") as tmp:
+        work = Path(tmp)
+        pem, der, pub = work / "key.pem", work / "key.der", work / "pub.der"
+        steps = (
+            [openssl, "ecparam", "-name", "prime256v1", "-genkey", "-noout", "-out", str(pem)],
+            [openssl, "ec", "-in", str(pem), "-outform", "DER", "-out", str(der)],
+            [openssl, "ec", "-in", str(pem), "-pubout", "-outform", "DER", "-out", str(pub)],
+        )
+        for step in steps:
+            cp = subprocess.run(step, capture_output=True, text=True, timeout=20)
+            if cp.returncode != 0:
+                raise Fail("openssl: " + (cp.stderr or cp.stdout).strip()[-200:])
+        private_key = base64.b64encode(der.read_bytes()).decode()
+        public_key = base64.b64encode(pub.read_bytes()).decode()
+    return private_key, public_key
+
+
+def strip_endpoint(value):
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    match = re.match(r"^\[([^\]]+)\](?::\d+)?$", text)
+    if match:
+        return match.group(1)
+    if re.match(r"^\d{1,3}(?:\.\d{1,3}){3}:\d+$", text):
+        return text.rsplit(":", 1)[0]
+    return text
+
+
+def cidr_of(value, version):
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        suffix = "32" if version == 4 else "128"
+        return str(ipaddress.ip_network(text if "/" in text else "%s/%s" % (text, suffix),
+                                        strict=False))
+    except ValueError:
+        return ""
+
+
+def warp_enroll_fields(updated, account):
+    peer = ((updated.get("config") or {}).get("peers") or [{}])[0]
+    iface = ((updated.get("config") or {}).get("interface") or {}).get("addresses") or {}
+    endpoint = peer.get("endpoint") or {}
+    fresh = dict(account)
+    fresh.update({
+        "endpoint_pub_key": peer.get("public_key") or account.get("endpoint_pub_key", ""),
+        "endpoint_v4": strip_endpoint(endpoint.get("v4")) or account.get("endpoint_v4", ""),
+        "endpoint_v6": strip_endpoint(endpoint.get("v6")) or account.get("endpoint_v6", ""),
+        "ipv4": iface.get("v4") or account.get("ipv4", ""),
+        "ipv6": iface.get("v6") or account.get("ipv6", ""),
+        "license": ((updated.get("account") or {}).get("license") or account.get("license", "")),
+        "nameserver": ((updated.get("config") or {}).get("interface") or {}).get("dns")
+                      or account.get("nameserver", []),
+    })
+    return fresh
+
+
+def warp_register():
+    if os.environ.get("KICH_DPI_OFFLINE"):
+        raise Fail("регистрация WARP недоступна в офлайн-режиме")
+    now = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
+    reg = cf_request("/reg", {
+        "key": base64.b64encode(secrets.token_bytes(32)).decode(),
+        "install_id": "",
+        "fcm_token": "",
+        "tos": now,
+        "model": "PC",
+        "serial_number": secrets.token_hex(8),
+        "os_version": "",
+        "key_type": "curve25519",
+        "tunnel_type": "wireguard",
+        "locale": "en_US",
+    })
+    if not reg.get("id") or not reg.get("token"):
+        raise Fail("Cloudflare не вернул id/token при регистрации")
+    private_key, public_key = warp_keys()
+    name = ("omarchy-%s" % (platform.node() or "linux"))[:64]
+    updated = cf_request("/reg/%s" % reg["id"], {
+        "key": public_key,
+        "key_type": "secp256r1",
+        "tunnel_type": "masque",
+        "name": name,
+    }, token=reg["token"], method="PATCH")
+    account = {
+        "private_key": private_key,
+        "public_key": public_key,
+        "id": updated.get("id") or reg["id"],
+        "access_token": reg["token"],
+        "name": name,
+        "registered_at": int(time.time()),
+    }
+    account = warp_enroll_fields(updated, account)
+    if not account.get("endpoint_pub_key"):
+        raise Fail("Cloudflare не вернул ключ MASQUE-шлюза")
+    if not account.get("ipv4") and not account.get("ipv6"):
+        raise Fail("Cloudflare не вернул адрес устройства")
+    save_warp_account(account)
+    return account
+
+
+def warp_enroll(account):
+    updated = cf_request("/reg/%s" % account["id"], {
+        "key": account["public_key"],
+        "key_type": "secp256r1",
+        "tunnel_type": "masque",
+        "name": account.get("name") or "omarchy",
+    }, token=account["access_token"], method="PATCH")
+    fresh = warp_enroll_fields(updated, account)
+    save_warp_account(fresh)
+    return fresh
+
+
+def yaml_str(value):
+    return json.dumps(str(value), ensure_ascii=False)
+
+
+def warp_config_text(account):
+    if not account:
+        raise Fail("аккаунт WARP не зарегистрирован")
+    gateway = "".join(line for line in str(account.get("endpoint_pub_key") or "").splitlines()
+                      if not line.startswith("-----")).strip()
+    if not gateway:
+        raise Fail("в аккаунте нет ключа MASQUE-шлюза")
+    ip4 = cidr_of(account.get("ipv4"), 4)
+    ip6 = cidr_of(account.get("ipv6"), 6)
+    ipv6_on = bool(ip6)
+
+    lines = []
+    add = lines.append
+    add("# Generated by kich-dpi. Do not edit: change the plugin instead.")
+    add("# WARP over MASQUE (HTTP/2) · account %s" % str(account.get("id") or "")[:8])
+    add("mixed-port: 0")
+    add("allow-lan: false")
+    add("mode: rule")
+    add("log-level: warning")
+    add("ipv6: %s" % ("true" if ipv6_on else "false"))
+    add("find-process-mode: off")
+    add("tun:")
+    add("  enable: true")
+    add("  stack: gvisor")
+    add("  device: kichwarp")
+    add("  auto-route: true")
+    add("  auto-detect-interface: true")
+    add("  auto-redirect: false")
+    add("  dns-hijack:")
+    add("    - any:53")
+    add("    - tcp://any:53")
+    add("  mtu: 1280")
+    if ipv6_on:
+        add("  inet6-address:")
+        add("    - fdfe:dcba:9876::1/126")
+    add("  route-exclude-address:")
+    for address in WARP_ENDPOINTS:
+        add("    - %s/32" % address)
+    for address in ("192.168.0.0/16", "10.0.0.0/8", "172.16.0.0/12", "127.0.0.0/8"):
+        add("    - %s" % address)
+    add("  strict-route: false")
+    add("dns:")
+    add("  enable: true")
+    add("  listen: 127.0.0.1:1053")
+    add("  ipv6: %s" % ("true" if ipv6_on else "false"))
+    if ipv6_on:
+        add("  fake-ip-range6: fc00::1/18")
+    add("  enhanced-mode: fake-ip")
+    add("  fake-ip-range: 198.18.0.1/16")
+    add("  fake-ip-filter:")
+    for domain in WARP_DIRECT:
+        add("    - DOMAIN-SUFFIX,%s,real-ip" % domain)
+    for domain in ("lan", "local", "home.arpa"):
+        add("    - DOMAIN-SUFFIX,%s,real-ip" % domain)
+    add("  default-nameserver: [77.88.8.8, 1.1.1.1]")
+    add("  nameserver: [https://1.1.1.1/dns-query, https://1.0.0.1/dns-query]")
+    add("  direct-nameserver: [77.88.8.8, 77.88.8.1]")
+    add("  proxy-server-nameserver: [77.88.8.8, 77.88.8.1]")
+    add("proxies:")
+    names = []
+    for index, server in enumerate(WARP_ENDPOINTS, 1):
+        name = "WARP %02d %s" % (index, server)
+        names.append(name)
+        add("  - name: %s" % yaml_str(name))
+        add("    type: masque")
+        add("    server: %s" % yaml_str(server))
+        add("    port: 443")
+        add("    private-key: %s" % yaml_str(account["private_key"]))
+        add("    public-key: %s" % yaml_str(gateway))
+        if ip4:
+            add("    ip: %s" % yaml_str(ip4))
+        if ip6:
+            add("    ipv6: %s" % yaml_str(ip6))
+        add("    mtu: 1280")
+        add("    udp: false")
+        add("    sni: %s" % yaml_str(WARP_SNI))
+        add("    network: h2")
+        add("    ip-stack:")
+        add("      mode: auto")
+        add("      congestion-controller: bbr")
+        add("    remote-dns-resolve: true")
+        add("    dns: [\"https://1.1.1.1/dns-query\"]")
+        add("    handshake-timeout: 20")
+    add("proxy-groups:")
+    add("  - name: PROXY")
+    add("    type: url-test")
+    add("    url: \"https://www.gstatic.com/generate_204\"")
+    add("    expected-status: 204")
+    add("    interval: 300")
+    add("    tolerance: 50")
+    add("    timeout: 5000")
+    add("    proxies:")
+    for name in names:
+        add("      - %s" % yaml_str(name))
+    add("rules:")
+    for domain in WARP_DIRECT:
+        add("  - DOMAIN-SUFFIX,%s,DIRECT" % domain)
+    for domain in ("lan", "local", "home.arpa"):
+        add("  - DOMAIN-SUFFIX,%s,DIRECT" % domain)
+    for address in ("192.168.0.0/16", "10.0.0.0/8", "172.16.0.0/12", "127.0.0.0/8",
+                    "169.254.0.0/16"):
+        add("  - IP-CIDR,%s,DIRECT,no-resolve" % address)
+    # H2 carries TCP only: keep voice calls and games on the local network
+    # instead of silently breaking them.
+    add("  - NETWORK,udp,DIRECT")
+    add("  - MATCH,PROXY")
+    add("")
+    return "\n".join(lines)
+
+
+def warp_build(account=None):
+    account = account or warp_account()
+    if not account:
+        raise Fail("WARP ещё не зарегистрирован")
+    text = warp_config_text(account)
+    write_text(WARP_CONFIG, text, 0o600)
+    return WARP_CONFIG
+
+
+def warp_conflict():
+    try:
+        cp = subprocess.run(["systemctl", "is-active", "omarchy-usque.service"],
+                            capture_output=True, text=True, timeout=4)
+        if cp.stdout.strip() == "active":
+            return "туннель omarchy-usque активен"
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return ""
+
+
+def warp_check_data():
+    data = read_json(WARP_CHECK_FILE, {})
+    return data if isinstance(data, dict) else {}
+
+
+def warp_status():
+    active, enabled = warp_unit_state()
+    account = warp_account()
+    conflict = warp_conflict()
+    check = warp_check_data()
+    error = ""
+    if not warp_available():
+        error = "mihomo не установлен"
+    elif conflict:
+        error = conflict
+    elif active == "failed":
+        error = "служба WARP не запустилась"
+    return {
+        "available": warp_available(),
+        "registered": bool(account),
+        "configured": WARP_CONFIG.exists(),
+        "running": active == "active",
+        "failed": active == "failed",
+        "active": active,
+        "enabled": enabled,
+        "conflict": conflict,
+        "name": str(account.get("name") or ""),
+        "account": str(account.get("id") or "")[:8],
+        "check": check,
+        "error": error,
+    }
+
+
+def cmd_warp_on():
+    conflict = warp_conflict()
+    if conflict:
+        raise Fail("%s — выключите его, два туннеля конфликтуют" % conflict)
+    if not warp_available():
+        raise Fail("mihomo не установлен: сначала установите плагин")
+    account = warp_account()
+    if not account:
+        account = warp_register()
+    if not WARP_CONFIG.exists():
+        warp_build(account)
+    cp = warp_systemctl("restart", timeout=30)
+    if cp.returncode != 0:
+        raise Fail((cp.stderr or cp.stdout or "systemctl restart не удался").strip()[-400:])
+    out({"ok": True, "warp": warp_status()})
+
+
+def cmd_warp_off():
+    warp_systemctl("stop", timeout=25)
+    out({"ok": True, "warp": warp_status()})
+
+
+def cmd_warp_toggle():
+    active, _ = warp_unit_state()
+    if active == "active":
+        cmd_warp_off()
+    else:
+        cmd_warp_on()
+
+
+def cmd_warp_register():
+    account = warp_account()
+    if account:
+        try:
+            account = warp_enroll(account)
+        except Fail:
+            if not warp_available():
+                raise
+            account = warp_register()
+    else:
+        account = warp_register()
+    warp_build(account)
+    out({"ok": True, "registered": True, "name": account.get("name", ""),
+         "account": str(account.get("id") or "")[:8]})
+
+
+def cmd_warp_check():
+    started = time.monotonic()
+    result = {"time": int(time.time()), "ok": False, "warp": "", "ip": "", "colo": "",
+              "ms": 0, "error": ""}
+    try:
+        cp = subprocess.run(
+            ["curl", "-fsS", "--max-time", "10",
+             "https://www.cloudflare.com/cdn-cgi/trace"],
+            capture_output=True, text=True, timeout=15,
+        )
+        if cp.returncode != 0:
+            result["error"] = (cp.stderr or "нет ответа").strip()[:200]
+        else:
+            values = {}
+            for line in cp.stdout.splitlines():
+                if "=" in line:
+                    key, _, value = line.partition("=")
+                    values[key.strip()] = value.strip()
+            result["warp"] = values.get("warp", "")
+            result["ip"] = values.get("ip", "")
+            result["colo"] = values.get("colo", "")
+            result["ok"] = result["warp"] in ("on", "plus")
+            if not result["ok"]:
+                result["error"] = "трафик не идёт через WARP"
+    except (OSError, subprocess.SubprocessError) as exc:
+        result["error"] = str(exc)[:200]
+    result["ms"] = int((time.monotonic() - started) * 1000)
+    write_json(WARP_CHECK_FILE, result)
+    out({"ok": True, "check": result})
+
 
 
 # -------------------------------------------------------------------- state
@@ -708,6 +1363,7 @@ def status_data():
         "progress": progress,
         "strategies": rows[:8],
         "conflict": other,
+        "warp": warp_status(),
         "error": error,
     }
 
@@ -935,6 +1591,10 @@ def cmd_generate():
 # ------------------------------------------------------------------- engine
 
 NFT_SCRIPT = """table inet {table} {{
+  set warp_ep {{
+    type ipv4_addr
+    elements = {{ {warp_ips} }}
+  }}
   chain predefrag {{
     type filter hook output priority -401; policy accept;
     meta mark and {mark} != 0 notrack comment "kich-dpi generated"
@@ -942,6 +1602,7 @@ NFT_SCRIPT = """table inet {table} {{
   chain out {{
     type filter hook postrouting priority 101; policy accept;
     meta oiftype 65534 return comment "skip tunnels"
+    ip daddr @warp_ep return comment "skip WARP endpoints"
     meta mark and {mark} != 0 return
     tcp dport {{ 80, 443 }} ct original packets 1-16 queue num {queue} bypass
     udp dport 443 ct original packets 1-6 queue num {queue} bypass
@@ -949,6 +1610,7 @@ NFT_SCRIPT = """table inet {table} {{
   chain in {{
     type filter hook prerouting priority -101; policy accept;
     meta iiftype 65534 return comment "skip tunnels"
+    ip saddr @warp_ep return comment "skip WARP endpoints"
     meta mark and {mark} != 0 return
     tcp sport {{ 80, 443 }} ct reply packets 1-12 queue num {queue} bypass
     udp sport 443 ct reply packets 1-4 queue num {queue} bypass
@@ -958,7 +1620,8 @@ NFT_SCRIPT = """table inet {table} {{
 
 
 def fw_up():
-    script = NFT_SCRIPT.format(table=TABLE, mark=FWMARK, queue=QUEUE)
+    script = NFT_SCRIPT.format(table=TABLE, mark=FWMARK, queue=QUEUE,
+                               warp_ips=", ".join(WARP_ENDPOINTS))
     subprocess.run(["nft", "delete", "table", "inet", TABLE],
                    capture_output=True, text=True)
     cp = subprocess.run(["nft", "-f", "-"], input=script,
@@ -1063,6 +1726,11 @@ def cmd_doctor():
     add("служба", not state["failed"], state["active"])
     add("конфликт zapret2", not state["conflict"],
         "omarchy-zapret2 активен" if state["conflict"] else "нет")
+    warp = state["warp"]
+    add("mihomo", warp["available"], mihomo_version())
+    add("аккаунт WARP", warp["registered"], warp["account"])
+    add("служба WARP", not warp["failed"], warp["active"])
+    add("конфликт WARP", not warp["conflict"], warp["conflict"] or "нет")
     if state["active_name"]:
         add("стратегия", True, state["active_name"])
     out({"ok": True, "checks": checks, "status": state})
@@ -1082,7 +1750,12 @@ def main(argv):
             "  update                 обновить движок (pkexec)\n"
             "  remove [--purge]       удалить системную часть (pkexec)\n"
             "  logs [N]               последние строки журнала\n"
-            "  doctor                 диагностика\n")
+            "  doctor                 диагностика\n"
+            "\n"
+            "WARP (MASQUE, необязательно):\n"
+            "  warp-on | warp-off | warp-toggle\n"
+            "  warp-register          перерегистрировать аккаунт Cloudflare\n"
+            "  warp-check             проверить, идёт ли трафик через WARP\n")
         return 0
 
     cmd = argv[1]
@@ -1121,6 +1794,16 @@ def main(argv):
             cmd_logs(int(argv[2]) if len(argv) > 2 and argv[2].isdigit() else 80)
         elif cmd == "doctor":
             cmd_doctor()
+        elif cmd == "warp-on":
+            cmd_warp_on()
+        elif cmd == "warp-off":
+            cmd_warp_off()
+        elif cmd == "warp-toggle":
+            cmd_warp_toggle()
+        elif cmd == "warp-register":
+            cmd_warp_register()
+        elif cmd == "warp-check":
+            cmd_warp_check()
         else:
             raise Fail("неизвестная команда: %s" % cmd)
     except Fail as exc:

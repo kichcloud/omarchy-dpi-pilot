@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "kich.dpi-pilot",
   "name": "DPI Pilot",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": "kich",
   "license": "MIT",
-  "description": "One-button zapret2 DPI bypass for Omarchy: generate strategies, measure YouTube/Discord/Google, keep the best. No lists, tabs or presets.",
+  "description": "One-button zapret2 DPI bypass plus an optional WARP MASQUE tunnel for Omarchy: generate strategies, measure YouTube/Discord/Google, keep the best. No lists, tabs or presets.",
   "kinds": ["bar-widget"],
   "entryPoints": {
     "barWidget": "DpiPilot.qml"

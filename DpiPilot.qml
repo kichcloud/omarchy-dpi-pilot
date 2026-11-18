@@ -56,6 +56,30 @@ Panel {
   readonly property string strategyName: st !== null && st.active_name ? st.active_name : ""
   readonly property string engine: st !== null && st.engine ? st.engine : ""
   readonly property bool conflict: st !== null && st.conflict === true
+  readonly property var warp: st !== null && st.warp ? st.warp : ({})
+  readonly property bool warpAvailable: warp.available === true
+  readonly property bool warpRunning: warp.running === true
+  readonly property bool warpRegistered: warp.registered === true
+  readonly property string warpConflict: warp.conflict ? String(warp.conflict) : ""
+  readonly property string warpAccount: warp.account ? String(warp.account) : ""
+  readonly property var warpCheck: warp.check ? warp.check : ({})
+  readonly property string warpCheckText: {
+    if (!warpCheck || !warpCheck.time) return ""
+    if (Date.now() / 1000 - warpCheck.time > 900) return ""
+    return warpCheck.ok && warpCheck.ip ? String(warpCheck.ip) : ""
+  }
+  readonly property string warpText: {
+    if (!warpAvailable) return "mihomo не установлен — нажмите, чтобы доустановить"
+    if (warpConflict !== "") return "Недоступен: " + warpConflict
+    if (warpRunning) {
+      if (warpCheckText !== "")
+        return "Выход " + warpCheckText + (warpCheck.colo ? " · " + warpCheck.colo : "")
+      return "Туннель включён"
+    }
+    if (warp.failed === true) return "Служба не запустилась — смотрите журнал"
+    if (warpRegistered) return "Готов включить туннель"
+    return "Аккаунт Cloudflare создастся при включении"
+  }
   readonly property bool busy: actionProc.running
   readonly property string errorText: actionError !== "" ? actionError
     : (st !== null && st.installed === true && st.error ? st.error : "")
@@ -72,6 +96,7 @@ Panel {
     var text = "DPI Pilot · " + stateText
     if (strategyName !== "") text += " · " + strategyName
     if (check && check.passed !== undefined) text += " · " + check.passed + "/" + (check.total || 3)
+    if (warpRunning) text += " · WARP"
     return text
   }
 
@@ -157,6 +182,21 @@ Panel {
       else flash("Проверка завершена")
     } else if (name === "install" || name === "update") {
       flash(name === "install" ? "Движок установлен" : "Движок обновлён")
+      if (parsed && parsed.warp === false && parsed.warp_note)
+        actionError = "mihomo: " + parsed.warp_note
+    } else if (name === "warp") {
+      if (parsed && parsed.warp && parsed.warp.running === true) {
+        flash("WARP подключён")
+        startAction("warp-check", [bin, "warp-check"], "Проверка WARP…")
+      } else {
+        flash("WARP отключён")
+      }
+    } else if (name === "warp-check") {
+      if (parsed && parsed.check && parsed.check.ok)
+        flash("WARP работает" + (parsed.check.ip ? " · " + parsed.check.ip : ""))
+      else
+        actionError = parsed && parsed.check && parsed.check.error
+          ? parsed.check.error : "WARP не подтвердился"
     } else if (name === "remove") {
       advanced = false
       flash("Системная часть удалена")
@@ -185,6 +225,20 @@ Panel {
   function installEngine() {
     if (busy) return
     startAction("install", ["pkexec", bin, "setup"], "Установка движка…")
+  }
+
+  function toggleWarp() {
+    if (!installed) { installEngine(); return }
+    if (busy || generating) return
+    if (warpConflict !== "") {
+      flash("Сначала выключите omarchy-usque")
+      return
+    }
+    if (!warpAvailable) {
+      startAction("install", ["pkexec", bin, "setup"], "Установка mihomo…")
+      return
+    }
+    startAction("warp", [bin, "warp-toggle"], warpRunning ? "Отключение WARP…" : "Подключение WARP…")
   }
 
   function updateEngine() {
@@ -258,6 +312,7 @@ Panel {
     function close(): void { root.close() }
     function toggle(): void { root.open() }
     function service(): void { root.toggleBypass() }
+    function warp(): void { root.toggleWarp() }
     function check(): void { root.runCheck() }
     function generate(): void { root.runGenerate() }
     function refresh(): void { root.refresh() }
@@ -304,6 +359,7 @@ Panel {
         if (text === "r" || text === "R") root.refresh()
         else if (text === "c" || text === "C") root.runCheck()
         else if (text === "g" || text === "G") root.runGenerate()
+        else if (text === "w" || text === "W") root.toggleWarp()
       }
 
       Flickable {
@@ -455,6 +511,56 @@ Panel {
                 accent: root.failed ? root.urgent : root.accent
                 Layout.alignment: Qt.AlignVCenter
                 onToggled: root.toggleBypass()
+              }
+            }
+          }
+
+          // ----------------------------------------------------------- warp
+          BorderSurface {
+            width: parent.width
+            implicitHeight: warpRow.implicitHeight + Style.space(22)
+            visible: root.installed
+            color: Style.normalFillFor(root.foreground, root.accent)
+            borderSpec: Border.flat(Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.14), 1)
+            radius: Style.cornerRadius
+
+            RowLayout {
+              id: warpRow
+              anchors.fill: parent
+              anchors.leftMargin: Style.space(12)
+              anchors.rightMargin: Style.space(12)
+              spacing: Style.space(10)
+
+              ColumnLayout {
+                Layout.fillWidth: true
+                spacing: 2
+
+                Text {
+                  text: "WARP"
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.subtitle
+                  font.bold: true
+                }
+
+                Text {
+                  Layout.fillWidth: true
+                  text: root.warpText
+                  color: root.warpRunning || root.warpConflict !== "" ? root.dim
+                    : root.warp.failed === true ? root.urgent : root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  wrapMode: Text.WordWrap
+                }
+              }
+
+              ToggleSwitch {
+                checked: root.warpRunning
+                busy: root.busy || root.generating
+                foreground: root.foreground
+                accent: root.warpConflict !== "" ? root.faint : root.accent
+                Layout.alignment: Qt.AlignVCenter
+                onToggled: root.toggleWarp()
               }
             }
           }

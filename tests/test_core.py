@@ -4,6 +4,7 @@ import io
 import json
 import os
 import pathlib
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -133,6 +134,87 @@ class EngineExtractTest(unittest.TestCase):
                 mod.extract_engine(archive, "v1")
 
 
+class WarpTest(unittest.TestCase):
+    ACCOUNT = {
+        "private_key": "cHJpdg==",
+        "public_key": "cHVi",
+        "endpoint_pub_key": "-----BEGIN PUBLIC KEY-----\nMFkwEwYH\n-----END PUBLIC KEY-----",
+        "id": "abcdef123456",
+        "access_token": "token",
+        "name": "omarchy-test",
+        "ipv4": "172.16.0.2",
+        "ipv6": "2606:4700:110:8a36::2",
+    }
+
+    def setUp(self):
+        self.mod = load()
+
+    def test_config_is_valid_and_keeps_ru_traffic_direct(self):
+        try:
+            import yaml
+        except ImportError:
+            self.skipTest("pyyaml is not installed")
+        data = yaml.safe_load(self.mod.warp_config_text(self.ACCOUNT))
+        self.assertTrue(data["tun"]["enable"])
+        self.assertEqual(data["tun"]["device"], "kichwarp")
+        self.assertEqual(len(data["proxies"]), 4)
+        for proxy in data["proxies"]:
+            self.assertEqual(proxy["type"], "masque")
+            self.assertEqual(proxy["port"], 443)
+            self.assertEqual(proxy["network"], "h2")
+            self.assertNotIn("BEGIN", proxy["public-key"])
+        self.assertIn("DOMAIN-SUFFIX,gosuslugi.ru,DIRECT", data["rules"])
+        self.assertIn("NETWORK,udp,DIRECT", data["rules"])
+        self.assertEqual(data["rules"][-1], "MATCH,PROXY")
+
+    def test_missing_account_is_rejected(self):
+        with self.assertRaises(self.mod.Fail):
+            self.mod.warp_config_text({})
+
+    def test_endpoint_and_cidr_normalisation(self):
+        self.assertEqual(self.mod.strip_endpoint("162.159.198.2:443"), "162.159.198.2")
+        self.assertEqual(self.mod.strip_endpoint("[2606:4700::1]:443"), "2606:4700::1")
+        self.assertEqual(self.mod.cidr_of("172.16.0.2", 4), "172.16.0.2/32")
+        self.assertEqual(self.mod.cidr_of("2606:4700::2", 6), "2606:4700::2/128")
+        self.assertEqual(self.mod.cidr_of("bad", 4), "")
+
+    def test_conflict_detection_reports_active_usque(self):
+        from unittest import mock
+        mod = self.mod
+        with mock.patch.object(mod.subprocess, "run", return_value=subprocess.CompletedProcess(
+                ["systemctl"], 0, "active\n", "")):
+            self.assertTrue(mod.warp_conflict())
+        with mock.patch.object(mod.subprocess, "run", return_value=subprocess.CompletedProcess(
+                ["systemctl"], 3, "inactive\n", "")):
+            self.assertEqual(mod.warp_conflict(), "")
+
+    def test_config_passes_mihomo_validation(self):
+        binary = os.environ.get("KICH_DPI_MIHOMO")
+        if not binary or not pathlib.Path(binary).exists():
+            self.skipTest("KICH_DPI_MIHOMO is not set")
+        if not shutil.which("openssl"):
+            self.skipTest("openssl is not installed")
+        private_key, public_key = self.mod.warp_keys()
+        _, gateway = self.mod.warp_keys()
+        account = dict(self.ACCOUNT, private_key=private_key, public_key=public_key,
+                       endpoint_pub_key=gateway)
+        with tempfile.TemporaryDirectory() as tmp:
+            config = pathlib.Path(tmp) / "warp.yaml"
+            config.write_text(self.mod.warp_config_text(account), encoding="utf-8")
+            cp = subprocess.run([binary, "-t", "-f", str(config), "-d", tmp],
+                                capture_output=True, text=True, timeout=60)
+            self.assertEqual(cp.returncode, 0, cp.stdout + cp.stderr)
+
+    def test_nft_skips_warp_endpoints(self):
+        script = self.mod.NFT_SCRIPT.format(
+            table="kich_dpi", mark="0x10000000", queue=230,
+            warp_ips=", ".join(self.mod.WARP_ENDPOINTS))
+        for endpoint in self.mod.WARP_ENDPOINTS:
+            self.assertIn(endpoint, script)
+        self.assertIn("ip daddr @warp_ep return", script)
+        self.assertIn("ip saddr @warp_ep return", script)
+
+
 class StateTest(unittest.TestCase):
     def setUp(self):
         self.mod = load()
@@ -144,16 +226,20 @@ class StateTest(unittest.TestCase):
         self.mod.STRATEGIES_FILE = self.mod.CONFIG_DIR / "strategies.json"
         self.mod.CHECK_FILE = self.mod.STATE_DIR / "check.json"
         self.mod.PROGRESS_FILE = self.mod.STATE_DIR / "progress.json"
+        self.mod.WARP_ACCOUNT = base / "account.json"
+        self.mod.WARP_CONFIG = self.mod.CONFIG_DIR / "warp.yaml"
+        self.mod.WARP_CHECK_FILE = self.mod.STATE_DIR / "warp-check.json"
 
     def tearDown(self):
         self.tmp.cleanup()
 
     def test_status_shape_without_engine(self):
+        from unittest import mock
         self.mod.installed_version = lambda: ""
         self.mod.unit_state = lambda: ("inactive", "not-found")
-        self.mod.subprocess.run = lambda *a, **k: subprocess.CompletedProcess(
-            ["systemctl"], 1, "", "")
-        data = self.mod.status_data()
+        with mock.patch.object(self.mod.subprocess, "run",
+                               return_value=subprocess.CompletedProcess(["systemctl"], 1, "", "")):
+            data = self.mod.status_data()
         for key in ("ok", "installed", "running", "generating", "strategies", "check"):
             self.assertIn(key, data)
         self.assertFalse(data["installed"])
