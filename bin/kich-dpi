@@ -34,7 +34,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-VERSION = "0.4.3"
+VERSION = "0.4.4"
 
 UNIT = "kich-dpi.service"
 TABLE = "kich_dpi"
@@ -1385,9 +1385,12 @@ def warp_config_text(account):
     for name in processes:
         add("  - PROCESS-NAME,%s,DIRECT" % name)
     add("  - RULE-SET,ru-domain,DIRECT")
-    # The tunnel is pointless for hosts inside Russia. `no-resolve` keeps the
-    # lookup off the fake-IP path: domains are already covered above.
-    add("  - RULE-SET,ru-ip,DIRECT,no-resolve")
+    # The tunnel is pointless for hosts inside Russia. No `no-resolve` here:
+    # with it the rule is skipped for every domain connection (mihomo sees a
+    # fake IP and a hostname), so the 8664 prefixes never applied to services
+    # missing from `ru-domain`. That sent `api.proxyapi.ru` through WARP, where
+    # the dial timed out and opencode kept dying with ECONNRESET.
+    add("  - RULE-SET,ru-ip,DIRECT")
     if own_domains:
         add("  - RULE-SET,direct-domains,DIRECT")
     for domain in ("lan", "local", "home.arpa"):

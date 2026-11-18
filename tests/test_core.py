@@ -196,7 +196,10 @@ class WarpTest(unittest.TestCase):
         self.assertEqual(data["rule-providers"]["ru-ip"]["behavior"], "ipcidr")
         self.assertTrue(pathlib.Path(data["rule-providers"]["ru-domain"]["path"]).is_file())
         self.assertIn("RULE-SET,ru-domain,DIRECT", data["rules"])
-        self.assertIn("RULE-SET,ru-ip,DIRECT,no-resolve", data["rules"])
+        self.assertIn("RULE-SET,ru-ip,DIRECT", data["rules"])
+        # `no-resolve` would skip this rule for every domain connection, so a
+        # Russian host missing from the domain list leaked into the tunnel.
+        self.assertNotIn("RULE-SET,ru-ip,DIRECT,no-resolve", data["rules"])
         self.assertIn("AND,((NETWORK,udp),(DST-PORT,443)),WARP", data["rules"])
         self.assertIn("NETWORK,udp,DIRECT", data["rules"])
         self.assertEqual(data["rules"][-1], "MATCH,WARP")
