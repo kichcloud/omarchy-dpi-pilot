@@ -5,14 +5,14 @@
   "version": "0.6.2",
   "author": "kich",
   "license": "MIT",
-  "description": "One-button zapret2 DPI bypass plus an optional WARP MASQUE tunnel for Omarchy: generate strategies, measure YouTube/Discord/Google, keep the best. Targets are set by a short domain list; no tabs or presets.",
+  "description": "Stock Omarchy network panel (connection stats, Wi-Fi, DNS provider) with a collapsible DPI Pilot drawer: zapret2 DPI bypass, WARP MASQUE tunnel, strategy generation and service checks.",
   "kinds": ["bar-widget"],
   "entryPoints": {
     "barWidget": "DpiPilot.qml"
   },
   "barWidget": {
-    "displayName": "DPI Pilot",
-    "description": "Toggle the DPI bypass, check blocked services and regenerate a strategy in one compact popup.",
+    "displayName": "Network + DPI Pilot",
+    "description": "Network connection, Wi-Fi and DNS controls with a DPI/WARP bypass drawer in the same panel.",
     "category": "Network",
     "allowMultiple": false,
     "defaultSection": "right"
