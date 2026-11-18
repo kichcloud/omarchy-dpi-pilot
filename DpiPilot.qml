@@ -276,6 +276,7 @@ Panel {
     function close() { root.close() }
     function toggle() { root.open() }
     function dpi() { root.dpiExpanded = true; root.open() }
+    function dpiToggle() { root.dpiExpanded = !root.dpiExpanded; root.open() }
     function service() { root.dpiInvoke("service") }
     function warp() { root.dpiInvoke("warp") }
     function check() { root.dpiInvoke("check") }
@@ -1811,34 +1812,22 @@ Panel {
         foreground: root.bar.foreground
       }
 
-      Column {
+      // DPI Pilot drawer. The header inside DpiSection.qml is the disclosure
+      // control. DpiSection is instantiated directly (not through a Loader,
+      // which would freeze its implicitHeight at load time and leave empty
+      // space in the popup when the details collapse).
+      DpiSection {
+        id: dpiDrawer
         width: parent.width
-        spacing: Style.space(8)
+        bar: root.bar
+        expanded: root.dpiExpanded
+        onToggleRequested: root.dpiExpanded = !root.dpiExpanded
 
-        Button {
-          id: dpiHeader
-          width: parent.width
-          text: root.dpiExpanded ? "DPI Pilot  ▴" : "DPI Pilot  ▾"
-          fontFamily: root.bar.fontFamily
-          fontSize: Style.font.body
-          foreground: root.bar.foreground
-          horizontalPadding: Style.spacing.controlPaddingX
-          verticalPadding: Style.spacing.controlPaddingY
-          onClicked: root.dpiExpanded = !root.dpiExpanded
-        }
-
-        Loader {
-          id: dpiLoader
-          width: parent.width
-          active: root.dpiExpanded
-          source: "DpiSection.qml"
-          onLoaded: {
-            item.bar = root.bar
-            root.dpiDrawerItem = item
-            if (root.dpiPending !== "") {
-              root.dpiRun(item, root.dpiPending)
-              root.dpiPending = ""
-            }
+        onDrawerReady: function(d) {
+          root.dpiDrawerItem = d
+          if (root.dpiPending !== "") {
+            root.dpiRun(d, root.dpiPending)
+            root.dpiPending = ""
           }
         }
       }

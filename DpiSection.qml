@@ -16,6 +16,11 @@ Item {
   id: root
   // Injected by the host panel's QML context; used only for theme colors/fonts.
   property var bar: null
+  // The header stays visible; only the details below it collapse. The host
+  // panel binds `expanded` and listens for `toggleRequested` on header clicks.
+  property bool expanded: false
+  signal toggleRequested()
+  signal drawerReady(var drawer)
   width: parent ? parent.width : 0
 
   readonly property string bin: {
@@ -260,7 +265,10 @@ Item {
     startAction("remove", ["pkexec", bin, "remove"], "Удаление…")
   }
 
-  Component.onCompleted: refresh()
+  Component.onCompleted: {
+    refresh()
+    drawerReady(this)
+  }
 
   Process {
     id: statusProc
@@ -282,7 +290,9 @@ Item {
   }
 
   Timer {
-    interval: root.visible ? (root.generating ? 900 : 2500) : 8000
+    // Only poll often while the drawer is open; when collapsed (or when the
+    // popup itself is hidden) fall back to a slow keep-warm tick.
+    interval: root.visible && root.expanded ? (root.generating ? 900 : 2500) : 8000
     running: true
     repeat: true
     triggeredOnStart: true
@@ -382,37 +392,70 @@ Item {
           width: parent.width
           spacing: Style.space(12)
 
-          // ------------------------------------------------------- header
+          // ------------------------------------------- disclosure header
           Row {
+            id: headerRow
             width: parent.width
             spacing: Style.space(10)
 
-            DpiIcon {
-              width: Style.space(30)
-              height: Style.space(30)
-              anchors.verticalCenter: parent.verticalCenter
-              color: root.foreground
-              accent: root.failed ? root.urgent : root.accent
-              filled: root.running
-            }
+            // Icon + labels + chevron form the clickable disclosure region.
+            // The MouseArea is the LAST child so it sits on top and collects
+            // clicks over the text/icon; the refresh button is a sibling of
+            // this region, so its clicks never toggle the drawer.
+            Item {
+              id: clickRegion
+              width: parent.width - refreshButton.width - parent.spacing
+              height: Math.max(dpiIcon.implicitHeight, headerLabels.implicitHeight)
 
-            Column {
-              width: parent.width - 30 - refreshButton.width - Style.space(20)
-              anchors.verticalCenter: parent.verticalCenter
-              spacing: 1
+              Row {
+                anchors.fill: parent
+                spacing: Style.space(10)
 
-              DpiText {
-                text: "DPI Pilot"
-                color: root.foreground
-                size: Style.font.title
-                font.bold: true
+                DpiIcon {
+                  id: dpiIcon
+                  width: Style.space(30)
+                  height: Style.space(30)
+                  anchors.verticalCenter: parent.verticalCenter
+                  color: root.foreground
+                  accent: root.failed ? root.urgent : root.accent
+                  filled: root.running
+                }
+
+                Column {
+                  id: headerLabels
+                  width: parent.width - dpiIcon.width - chevron.implicitWidth - parent.spacing * 2
+                  anchors.verticalCenter: parent.verticalCenter
+                  spacing: 1
+
+                  DpiText {
+                    text: "DPI Pilot"
+                    color: root.foreground
+                    size: Style.font.title
+                    font.bold: true
+                  }
+
+                  DpiText {
+                    width: parent.width
+                    text: root.stateText + (root.strategyName !== "" ? " · " + root.strategyName : "")
+                    color: root.failed ? root.urgent : root.dim
+                    elide: Text.ElideRight
+                  }
+                }
+
+                DpiText {
+                  id: chevron
+                  anchors.verticalCenter: parent.verticalCenter
+                  text: root.expanded ? "▴" : "▾"
+                  color: root.dim
+                  size: Style.font.body
+                }
               }
 
-              DpiText {
-                width: parent.width
-                text: root.stateText + (root.strategyName !== "" ? " · " + root.strategyName : "")
-                color: root.failed ? root.urgent : root.dim
-                elide: Text.ElideRight
+              MouseArea {
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onClicked: root.toggleRequested()
               }
             }
 
@@ -428,6 +471,14 @@ Item {
               onClicked: root.refresh()
             }
           }
+
+          // Everything below the header collapses as one block.
+          Column {
+            id: details
+            width: parent.width
+            visible: root.expanded
+            spacing: Style.space(12)
+
 
           // ------------------------------------------------------ install
           Column {
@@ -711,4 +762,5 @@ Item {
             }
           }
         }
+        }  // details
 }
