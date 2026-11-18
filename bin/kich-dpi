@@ -1175,7 +1175,10 @@ def warp_config_text(account):
     if ip6:
         add("    ipv6: %s" % yaml_str(ip6))
     add("    mtu: 1280")
-    add("    udp: false")
+    # QUIC (UDP 443) is a browser's first transport for YouTube. Sent DIRECT
+    # it stalls for about ten seconds before the fallback, which looks like a
+    # dead page, so it rides the tunnel as well.
+    add("    udp: true")
     add("    sni: %s" % yaml_str(WARP_SNI))
     add("    network: h2")
     # Google throttles its IPv4 ranges in Russia, and WARP's own egress lives
@@ -1198,8 +1201,9 @@ def warp_config_text(account):
     for address in ("192.168.0.0/16", "10.0.0.0/8", "172.16.0.0/12", "127.0.0.0/8",
                     "169.254.0.0/16"):
         add("  - IP-CIDR,%s,DIRECT,no-resolve" % address)
-    # H2 carries TCP only: keep voice calls and games on the local network
-    # instead of silently breaking them.
+    # Only QUIC goes through the tunnel. Voice calls, games and LAN discovery
+    # stay on the local network instead of silently breaking.
+    add("  - AND,((NETWORK,udp),(DST-PORT,443)),WARP")
     add("  - NETWORK,udp,DIRECT")
     add("  - MATCH,WARP")
     add("")

@@ -167,10 +167,13 @@ class WarpTest(unittest.TestCase):
         self.assertEqual(proxy["server"], self.mod.WARP_ENDPOINT)
         # YouTube's IPv4 egress is throttled here; its IPv6 path is clean.
         self.assertEqual(proxy["ip-version"], "ipv6-prefer")
+        # QUIC has to ride the tunnel too, otherwise browsers stall on it.
+        self.assertTrue(proxy["udp"])
         self.assertNotIn("BEGIN", proxy["public-key"])
         self.assertNotIn("proxy-groups", data)
         self.assertEqual(data["routing-mark"], 0x20000000)
         self.assertIn("DOMAIN-SUFFIX,gosuslugi.ru,DIRECT", data["rules"])
+        self.assertIn("AND,((NETWORK,udp),(DST-PORT,443)),WARP", data["rules"])
         self.assertIn("NETWORK,udp,DIRECT", data["rules"])
         self.assertEqual(data["rules"][-1], "MATCH,WARP")
 
