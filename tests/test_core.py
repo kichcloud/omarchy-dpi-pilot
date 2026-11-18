@@ -217,15 +217,16 @@ class WarpTest(unittest.TestCase):
 
     def test_nft_skips_warp_endpoints(self):
         script = self.mod.NFT_SCRIPT.format(
-            table="kich_dpi", mark="0x10000000", route_mark=self.mod.WARP_MARK,
+            table="kich_dpi", mark="0x10000000",
             queue=230, warp_ips=", ".join(self.mod.WARP_ENDPOINTS))
         for endpoint in self.mod.WARP_ENDPOINTS:
             self.assertIn(endpoint, script)
         self.assertIn("ip daddr @warp_ep return", script)
         self.assertIn("ip saddr @warp_ep return", script)
-        # Traffic mihomo dials itself goes through its userspace TCP stack;
-        # desyncing it broke RU sites, so it is left alone.
-        self.assertIn("meta mark and %s != 0 return" % self.mod.WARP_MARK, script)
+        # mihomo's own sockets are queued like everything else: the fwmark rule
+        # keeps their desynced packets out of the TUN, so RU sites mihomo dials
+        # DIRECT keep their bypass while WARP is up.
+        self.assertNotIn(self.mod.WARP_MARK, script)
 
     def test_fw_rule_keeps_stamped_packets_off_the_tunnel(self):
         from unittest import mock

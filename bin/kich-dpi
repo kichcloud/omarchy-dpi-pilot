@@ -34,7 +34,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-VERSION = "0.2.2"
+VERSION = "0.2.3"
 
 UNIT = "kich-dpi.service"
 TABLE = "kich_dpi"
@@ -96,10 +96,12 @@ WARP_ENDPOINTS = ("162.159.198.2", "162.159.199.2", "162.159.197.2", "162.159.19
 # clients use.
 WARP_ENDPOINT = "162.159.198.2"
 WARP_SNI = "speed.cloudflare.com"
-# mihomo marks every socket it opens with this value (`routing-mark`). DPI then
-# leaves those packets alone: RU traffic that mihomo sends DIRECT runs through
-# its own TCP stack, and the desync tricks meant for a kernel socket confuse
-# that stack (gosuslugi.ru timed out until this skip was added).
+# mihomo marks every socket it opens with this value (`routing-mark`). DPI used
+# to skip those packets: the desync appeared to break mihomo's userspace stack,
+# but the real cause was that nfqws2 re-injects packets without the flow's
+# device binding, and mihomo's policy rules then pulled them into the TUN. With
+# the DPI mark pinned to the main table (see `fw_rule`) the skip is gone, so RU
+# traffic that mihomo dials DIRECT keeps its bypass while WARP is up.
 WARP_MARK = "0x20000000"
 WARP_DIRECT = (
     # Russian services that must not leave the country through the tunnel.
@@ -1120,6 +1122,8 @@ def warp_config_text(account):
     # global v6 address for this to work.
     add("ipv6: true")
     add("find-process-mode: \"off\"")
+    # Identifies the sockets mihomo opens itself; DPI now handles them like any
+    # other traffic instead of skipping the mark.
     add("routing-mark: %s" % WARP_MARK)
     add("sniffer:")
     add("  enable: true")
@@ -1660,7 +1664,6 @@ NFT_SCRIPT = """table inet {table} {{
     meta oiftype 65534 return comment "skip tunnels"
     ip daddr @warp_ep return comment "skip WARP endpoints"
     meta mark and {mark} != 0 return
-    meta mark and {route_mark} != 0 return comment "skip mihomo traffic"
     tcp dport {{ 80, 443 }} ct original packets 1-16 queue num {queue} bypass
     udp dport 443 ct original packets 1-6 queue num {queue} bypass
   }}
@@ -1683,7 +1686,7 @@ def fw_rule(action):
 
 
 def fw_up():
-    script = NFT_SCRIPT.format(table=TABLE, mark=FWMARK, route_mark=WARP_MARK,
+    script = NFT_SCRIPT.format(table=TABLE, mark=FWMARK,
                                queue=QUEUE, warp_ips=", ".join(WARP_ENDPOINTS))
     subprocess.run(["nft", "delete", "table", "inet", TABLE],
                    capture_output=True, text=True)
