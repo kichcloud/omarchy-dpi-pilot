@@ -49,8 +49,11 @@ omarchy plugin add https://github.com/kichcloud/omarchy-dpi-pilot.git --enable -
 | `~/.local/state/kich-dpi/rules/` | списки российских доменов и IP, копия из `/opt/kich-dpi/app/data` |
 | `~/.config/kich-dpi/direct-domains.txt` | ваши домены мимо туннеля (не перезаписывается) |
 | `~/.config/kich-dpi/direct-processes.txt` | ваши программы мимо туннеля (не перезаписывается) |
-| `~/.local/share/kich-dpi/account.json` | ключи WARP-устройства (0600) |
+| `~/.local/state/kich-dpi/account.json` | ключи WARP-устройства (0600) |
+| `~/.local/state/kich-dpi/nfqws2.conf` | рабочий конфиг nfqws2, создаётся при старте службы |
 | `~/.local/state/kich-dpi/` | результаты проверок и прогресс подбора |
+
+С 0.4.0 всё изменяемое состояние лежит в `~/.local/state/kich-dpi`; каталоги `~/.local/share/kich-dpi` и `/run/kich-dpi` больше не создаются, а аккаунт WARP из старой раскладки переносится автоматически.
 
 Свои nftables-таблица `inet kich_dpi`, очередь `230` и метка `0x10000000` не пересекаются с `omarchy-zapret2`. Но два DPI-обходчика одновременно перехватывать один и тот же трафик не должны: попап предупредит, если `omarchy-zapret2.service` активен.
 

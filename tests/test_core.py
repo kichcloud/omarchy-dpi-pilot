@@ -435,10 +435,10 @@ class WarpConfigRefreshTest(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         home = pathlib.Path(self.tmp.name)
         (home / ".config" / "kich-dpi").mkdir(parents=True)
-        (home / ".local" / "share" / "kich-dpi").mkdir(parents=True)
+        (home / ".local" / "state" / "kich-dpi").mkdir(parents=True)
         self.home = home
         self.config = home / ".config" / "kich-dpi" / "warp.yaml"
-        self.account = home / ".local" / "share" / "kich-dpi" / "account.json"
+        self.account = home / ".local" / "state" / "kich-dpi" / "account.json"
         self.user = SimpleNamespace(pw_name="kich", pw_dir=str(home))
 
     def test_does_nothing_when_warp_is_not_in_use(self):
@@ -476,6 +476,47 @@ class WarpConfigRefreshTest(unittest.TestCase):
                                    ["runuser"], 1, "", "нет списков правил")):
             note = self.mod.refresh_warp_config(self.user)
         self.assertIn("нет списков правил", note) 
+
+
+class AccountMigrationTest(unittest.TestCase):
+    def setUp(self):
+        self.mod = load()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = pathlib.Path(self.tmp.name)
+        self.old_dir = self.home / ".local" / "share" / "kich-dpi"
+        self.old = self.old_dir / "account.json"
+        self.new = self.home / ".local" / "state" / "kich-dpi" / "account.json"
+
+    def test_moves_the_old_share_account_into_state(self):
+        self.old_dir.mkdir(parents=True)
+        self.old.write_text('{"id": "old"}', encoding="utf-8")
+        self.mod.migrate_account(self.home)
+        self.assertFalse(self.old_dir.exists())
+        self.assertEqual(self.new.read_text(encoding="utf-8"), '{"id": "old"}')
+        self.assertEqual(self.new.stat().st_mode & 0o777, 0o600)
+
+    def test_does_not_overwrite_an_already_migrated_account(self):
+        self.old_dir.mkdir(parents=True)
+        self.old.write_text('{"id": "old"}', encoding="utf-8")
+        self.new.parent.mkdir(parents=True)
+        self.new.write_text('{"id": "new"}', encoding="utf-8")
+        self.mod.migrate_account(self.home)
+        self.assertEqual(self.new.read_text(encoding="utf-8"), '{"id": "new"}')
+
+    def test_main_migrates_before_dispatch(self):
+        from unittest import mock
+        self.old_dir.mkdir(parents=True)
+        account = {"private_key": "k", "endpoint_pub_key": "p",
+                   "id": "i", "access_token": "t"}
+        self.old.write_text(json.dumps(account), encoding="utf-8")
+        self.mod.HOME = self.home
+        self.mod.WARP_ACCOUNT = self.new
+        buf = io.StringIO()
+        with mock.patch.object(self.mod.sys, "stdout", buf):
+            self.mod.main(["kich-dpi", "no-such-command"])
+        self.assertFalse(json.loads(buf.getvalue())["ok"])
+        self.assertEqual(json.loads(self.new.read_text(encoding="utf-8"))["id"], "i")
 
 
 class StateTest(unittest.TestCase):

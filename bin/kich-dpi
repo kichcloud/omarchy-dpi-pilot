@@ -34,7 +34,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 
 UNIT = "kich-dpi.service"
 TABLE = "kich_dpi"
@@ -61,7 +61,6 @@ TARGETS = (
 HOME = Path(os.environ.get("HOME") or pwd.getpwuid(os.getuid()).pw_dir)
 CONFIG_DIR = HOME / ".config" / ENGINE_SLUG
 STATE_DIR = HOME / ".local" / "state" / ENGINE_SLUG
-RUN_DIR = Path("/run") / ENGINE_SLUG
 ACTIVE_FILE = CONFIG_DIR / "active.json"
 STRATEGIES_FILE = CONFIG_DIR / "strategies.json"
 CHECK_FILE = STATE_DIR / "check.json"
@@ -73,8 +72,7 @@ WARP_UNIT = "kich-dpi-warp.service"
 WARP_UNIT_PATH = Path("/etc/systemd/system") / WARP_UNIT
 MIHOMO = ENGINE_ROOT / "mihomo"
 WARP_CONFIG = CONFIG_DIR / "warp.yaml"
-WARP_DATA = HOME / ".local" / "share" / ENGINE_SLUG
-WARP_ACCOUNT = WARP_DATA / "account.json"
+WARP_ACCOUNT = STATE_DIR / "account.json"
 WARP_CHECK_FILE = STATE_DIR / "warp-check.json"
 WARP_DEVICE = "kichwarp"
 # Local HTTP proxy mihomo opens next to the TUN. Diagnostics go through it so
@@ -683,8 +681,6 @@ Type=simple
 User={user}
 Group={group}
 Environment=HOME={home}
-RuntimeDirectory=kich-dpi
-RuntimeDirectoryMode=0700
 ExecStart=/usr/bin/python3 -I /opt/kich-dpi/app/bin/kich-dpi _run
 ExecStopPost=/usr/bin/python3 -I /opt/kich-dpi/app/bin/kich-dpi _fw-down
 Restart=on-failure
@@ -782,13 +778,19 @@ def install_system(user):
     subprocess.run(["systemctl", "daemon-reload"], capture_output=True, text=True)
     for unit in (UNIT, WARP_UNIT):
         subprocess.run(["systemctl", "enable", unit], capture_output=True, text=True)
-    for folder in (home / ".config" / ENGINE_SLUG, home / ".local" / "state" / ENGINE_SLUG,
-                   home / ".local" / "share" / ENGINE_SLUG):
+    for folder in (home / ".config" / ENGINE_SLUG, home / ".local" / "state" / ENGINE_SLUG):
         folder.mkdir(parents=True, exist_ok=True)
         try:
             os.chown(folder, user.pw_uid, user.pw_gid)
         except OSError:
             pass
+    migrate_account(home, user.pw_uid, user.pw_gid)
+    # 0.3.0 kept nfqws2.conf in a RuntimeDirectory; the new unit writes it
+    # into state, so drop the stale directory if systemd left it behind.
+    try:
+        shutil.rmtree(Path("/run") / ENGINE_SLUG)
+    except OSError:
+        pass
     try:
         subprocess.run(
             ["sysctl", "-q", "-w", "net.netfilter.nf_conntrack_tcp_be_liberal=1"],
@@ -815,7 +817,8 @@ def refresh_warp_config(user):
     """
     home = Path(user.pw_dir)
     config = home / ".config" / ENGINE_SLUG / "warp.yaml"
-    account = home / ".local" / "share" / ENGINE_SLUG / "account.json"
+    migrate_account(home)
+    account = home / ".local" / "state" / ENGINE_SLUG / "account.json"
     if not config.is_file() or not account.is_file():
         return ""
     try:
@@ -927,8 +930,13 @@ def cmd_remove(purge=False):
     subprocess.run(["systemctl", "daemon-reload"], capture_output=True, text=True)
     if ENGINE_ROOT.exists():
         shutil.rmtree(ENGINE_ROOT)
+    try:
+        shutil.rmtree(Path("/run") / ENGINE_SLUG)
+    except OSError:
+        pass
     if purge:
         home = Path(user.pw_dir)
+        # The share directory only exists on machines installed before 0.4.0.
         for path in (home / ".config" / ENGINE_SLUG, home / ".local" / "state" / ENGINE_SLUG,
                      home / ".local" / "share" / ENGINE_SLUG):
             if path.exists():
@@ -958,9 +966,28 @@ def warp_account():
     return data
 
 
+def migrate_account(home, uid=None, gid=None):
+    """Move the 0.3.0 account out of ~/.local/share; safe to repeat."""
+    legacy_dir = home / ".local" / "share" / ENGINE_SLUG
+    legacy = legacy_dir / "account.json"
+    target = home / ".local" / "state" / ENGINE_SLUG / "account.json"
+    if legacy.is_file() and not target.exists():
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(legacy), str(target))
+            os.chmod(target, 0o600)
+            if uid is not None and gid is not None:
+                os.chown(target, uid, gid)
+        except OSError:
+            pass
+    try:
+        legacy_dir.rmdir()
+    except OSError:
+        pass
+
+
 def save_warp_account(account):
-    WARP_DATA.mkdir(parents=True, exist_ok=True)
-    os.chmod(WARP_DATA, 0o700)
+    WARP_ACCOUNT.parent.mkdir(parents=True, exist_ok=True)
     tmp = WARP_ACCOUNT.with_name("." + WARP_ACCOUNT.name + ".tmp")
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(account, fh, ensure_ascii=False, indent=1)
@@ -1851,9 +1878,9 @@ def cmd__run():
         return 1
     active_doc = read_dict(ACTIVE_FILE)
     spec = active_doc.get("spec") if isinstance(active_doc.get("spec"), dict) else default_spec()
-    conf = RUN_DIR / "nfqws2.conf"
+    conf = STATE_DIR / "nfqws2.conf"
     try:
-        RUN_DIR.mkdir(parents=True, exist_ok=True)
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
         write_text(conf, render_config(spec), 0o600)
         fw_up()
     except (OSError, Fail) as exc:
@@ -1963,6 +1990,9 @@ def main(argv):
 
     cmd = argv[1]
     try:
+        # One-shot migration from the 0.3.0 layout, before any command reads
+        # or writes the account.
+        migrate_account(HOME)
         if cmd == "_run":
             return cmd__run()
         if cmd == "_fw-down":
