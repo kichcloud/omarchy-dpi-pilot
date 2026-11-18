@@ -54,6 +54,7 @@ Panel {
   readonly property var results: check && check.results ? check.results : []
   readonly property var strategies: st !== null && st.strategies ? st.strategies : []
   readonly property string strategyName: st !== null && st.active_name ? st.active_name : ""
+  readonly property string activeId: st !== null && st.active_id ? String(st.active_id) : ""
   readonly property string engine: st !== null && st.engine ? st.engine : ""
   readonly property bool conflict: st !== null && st.conflict === true
   readonly property var warp: st !== null && st.warp ? st.warp : ({})
@@ -327,6 +328,82 @@ Panel {
     function refresh(): void { root.refresh() }
   }
 
+  // ----------------------------------------------------------- primitives
+  // Every label shares one family and two sizes, and every button shares the
+  // same padding and disabled look: keeping that in components keeps the popup
+  // itself about layout instead of styling.
+  component DpiText: Text {
+    property bool wrap: false
+    property int size: Style.font.caption
+    color: root.dim
+    font.family: root.fontFamily
+    font.pixelSize: size
+    wrapMode: wrap ? Text.WordWrap : Text.NoWrap
+  }
+
+  component DpiButton: Button {
+    foreground: root.foreground
+    accent: root.accent
+    fontFamily: root.fontFamily
+    fontSize: Style.font.body
+    horizontalPadding: Style.spacing.controlPaddingX
+    verticalPadding: Style.spacing.controlPaddingY
+    opacity: enabled ? 1 : 0.55
+  }
+
+  component SwitchCard: BorderSurface {
+    id: card
+    property string title
+    property string detail
+    property bool isOn
+    property bool attention: false
+    property bool busy: false
+    property color accentColor: root.accent
+    signal toggled()
+
+    width: parent.width
+    implicitHeight: cardRow.implicitHeight + Style.space(22)
+    color: Style.normalFillFor(root.foreground, root.accent)
+    borderSpec: Border.flat(Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.14), 1)
+    radius: Style.cornerRadius
+
+    RowLayout {
+      id: cardRow
+      anchors.fill: parent
+      anchors.leftMargin: Style.space(12)
+      anchors.rightMargin: Style.space(12)
+      spacing: Style.space(10)
+
+      ColumnLayout {
+        Layout.fillWidth: true
+        spacing: 2
+
+        DpiText {
+          text: card.title
+          color: root.foreground
+          size: Style.font.subtitle
+          font.bold: true
+        }
+
+        DpiText {
+          Layout.fillWidth: true
+          text: card.detail
+          color: card.attention ? root.urgent : root.dim
+          wrap: true
+        }
+      }
+
+      ToggleSwitch {
+        checked: card.isOn
+        busy: card.busy
+        foreground: root.foreground
+        accent: card.accentColor
+        Layout.alignment: Qt.AlignVCenter
+        onToggled: card.toggled()
+      }
+    }
+  }
+
   // ------------------------------------------------------------------- bar
   WidgetButton {
     id: barButton
@@ -406,33 +483,27 @@ Panel {
               anchors.verticalCenter: parent.verticalCenter
               spacing: 1
 
-              Text {
+              DpiText {
                 text: "DPI Pilot"
                 color: root.foreground
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.title
+                size: Style.font.title
                 font.bold: true
               }
 
-              Text {
+              DpiText {
                 width: parent.width
                 text: root.stateText + (root.strategyName !== "" ? " · " + root.strategyName : "")
                 color: root.failed ? root.urgent : root.dim
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
                 elide: Text.ElideRight
               }
             }
 
-            Button {
+            DpiButton {
               id: refreshButton
               anchors.verticalCenter: parent.verticalCenter
               iconText: "󰑐"
               iconSpinning: statusProc.running || root.busy
               tooltipText: "Обновить (R)"
-              foreground: root.foreground
-              accent: root.accent
-              fontFamily: root.fontFamily
               iconSize: Style.font.subtitle
               horizontalPadding: Style.space(4)
               verticalPadding: Style.space(3)
@@ -446,132 +517,48 @@ Panel {
             spacing: Style.space(8)
             visible: root.reachable && !root.installed
 
-            Text {
+            DpiText {
               width: parent.width
               text: "Движок zapret2 ещё не установлен. Установка скачает официальный релиз bol-van/zapret2 и один раз попросит пароль."
-              color: root.dim
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.bodySmall
-              wrapMode: Text.WordWrap
+              size: Style.font.bodySmall
+              wrap: true
             }
 
-            Button {
+            DpiButton {
               width: parent.width
               text: root.busy ? root.actionLabel : "Установить"
               iconText: "󰇚"
               bordered: true
               active: true
               enabled: !root.busy
-              foreground: root.foreground
-              accent: root.accent
-              fontFamily: root.fontFamily
-              fontSize: Style.font.body
-              horizontalPadding: Style.spacing.controlPaddingX
-              verticalPadding: Style.spacing.controlPaddingY
               onClicked: root.installEngine()
             }
           }
 
           // -------------------------------------------------------- switch
-          BorderSurface {
-            width: parent.width
-            implicitHeight: switchRow.implicitHeight + Style.space(22)
+          SwitchCard {
             visible: root.installed
-            color: Style.normalFillFor(root.foreground, root.accent)
-            borderSpec: Border.flat(Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.14), 1)
-            radius: Style.cornerRadius
-
-            RowLayout {
-              id: switchRow
-              anchors.fill: parent
-              anchors.leftMargin: Style.space(12)
-              anchors.rightMargin: Style.space(12)
-              spacing: Style.space(10)
-
-              ColumnLayout {
-                Layout.fillWidth: true
-                spacing: 2
-
-                Text {
-                  text: "Обход DPI"
-                  color: root.foreground
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.subtitle
-                  font.bold: true
-                }
-
-                Text {
-                  Layout.fillWidth: true
-                  text: root.failed ? "Служба не запустилась — смотрите журнал"
-                    : root.running ? "Трафик идёт через nfqws2"
-                    : root.installed ? "Готов включить подобранную стратегию"
-                    : ""
-                  color: root.failed ? root.urgent : root.dim
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
-                  wrapMode: Text.WordWrap
-                }
-              }
-
-              ToggleSwitch {
-                checked: root.running
-                busy: root.busy || root.generating
-                foreground: root.foreground
-                accent: root.failed ? root.urgent : root.accent
-                Layout.alignment: Qt.AlignVCenter
-                onToggled: root.toggleBypass()
-              }
-            }
+            title: "Обход DPI"
+            detail: root.failed ? "Служба не запустилась — смотрите журнал"
+              : root.running ? "Трафик идёт через nfqws2"
+              : "Готов включить подобранную стратегию"
+            isOn: root.running
+            attention: root.failed
+            busy: root.busy || root.generating
+            accentColor: root.failed ? root.urgent : root.accent
+            onToggled: root.toggleBypass()
           }
 
           // ----------------------------------------------------------- warp
-          BorderSurface {
-            width: parent.width
-            implicitHeight: warpRow.implicitHeight + Style.space(22)
+          SwitchCard {
             visible: root.installed
-            color: Style.normalFillFor(root.foreground, root.accent)
-            borderSpec: Border.flat(Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.14), 1)
-            radius: Style.cornerRadius
-
-            RowLayout {
-              id: warpRow
-              anchors.fill: parent
-              anchors.leftMargin: Style.space(12)
-              anchors.rightMargin: Style.space(12)
-              spacing: Style.space(10)
-
-              ColumnLayout {
-                Layout.fillWidth: true
-                spacing: 2
-
-                Text {
-                  text: "WARP"
-                  color: root.foreground
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.subtitle
-                  font.bold: true
-                }
-
-                Text {
-                  Layout.fillWidth: true
-                  text: root.warpText
-                  color: root.warpRunning || root.warpConflict !== "" ? root.dim
-                    : root.warp.failed === true ? root.urgent : root.dim
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.caption
-                  wrapMode: Text.WordWrap
-                }
-              }
-
-              ToggleSwitch {
-                checked: root.warpRunning
-                busy: root.busy || root.generating
-                foreground: root.foreground
-                accent: root.warpConflict !== "" ? root.faint : root.accent
-                Layout.alignment: Qt.AlignVCenter
-                onToggled: root.toggleWarp()
-              }
-            }
+            title: "WARP"
+            detail: root.warpText
+            isOn: root.warpRunning
+            attention: root.warp.failed === true
+            busy: root.busy || root.generating
+            accentColor: root.warpConflict !== "" ? root.faint : root.accent
+            onToggled: root.toggleWarp()
           }
 
           // -------------------------------------------------------- check
@@ -592,12 +579,10 @@ Panel {
 
               Item { width: Math.max(0, parent.width - parent.children[0].implicitWidth - ageText.implicitWidth); height: 1 }
 
-              Text {
+              DpiText {
                 id: ageText
                 text: root.whenText()
                 color: root.faint
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
                 anchors.verticalCenter: parent.verticalCenter
               }
             }
@@ -631,11 +616,10 @@ Panel {
                     border.width: parent.result === null ? 1 : 0
                   }
 
-                  Text {
+                  DpiText {
                     text: modelData.label
                     color: parent.result === null ? root.dim : root.foreground
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.bodySmall
+                    size: Style.font.bodySmall
                     anchors.verticalCenter: parent.verticalCenter
                   }
                 }
@@ -646,7 +630,7 @@ Panel {
               width: parent.width
               spacing: Style.space(8)
 
-              Button {
+              DpiButton {
                 Layout.fillWidth: true
                 width: (parent.width - parent.spacing) * 0.58
                 text: root.actionName === "generate" ? "Подбор…" : "Подобрать"
@@ -654,29 +638,15 @@ Panel {
                 bordered: true
                 active: true
                 enabled: !root.busy && !root.generating
-                opacity: enabled ? 1 : 0.55
-                foreground: root.foreground
-                accent: root.accent
-                fontFamily: root.fontFamily
-                fontSize: Style.font.body
-                horizontalPadding: Style.spacing.controlPaddingX
-                verticalPadding: Style.spacing.controlPaddingY
                 tooltipText: "Собрать стратегии, проверить их и оставить лучшую (G)"
                 onClicked: root.runGenerate()
               }
 
-              Button {
+              DpiButton {
                 width: parent.width - (parent.width - parent.spacing) * 0.58 - parent.spacing
                 text: root.actionName === "check" ? "Проверка…" : "Проверить"
                 bordered: true
                 enabled: !root.busy && !root.generating
-                opacity: enabled ? 1 : 0.55
-                foreground: root.foreground
-                accent: root.accent
-                fontFamily: root.fontFamily
-                fontSize: Style.font.body
-                horizontalPadding: Style.spacing.controlPaddingX
-                verticalPadding: Style.spacing.controlPaddingY
                 tooltipText: "Проверить текущее состояние (C)"
                 onClicked: root.runCheck()
               }
@@ -692,22 +662,18 @@ Panel {
             Row {
               width: parent.width
 
-              Text {
+              DpiText {
                 text: "Подбор стратегий"
                 color: root.foreground
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.bodySmall
+                size: Style.font.bodySmall
                 font.bold: true
               }
 
               Item { width: Math.max(0, parent.width - parent.children[0].implicitWidth - countText.implicitWidth); height: 1 }
 
-              Text {
+              DpiText {
                 id: countText
                 text: (root.progress.done || 0) + " / " + (root.progress.total || 0)
-                color: root.dim
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
               }
             }
 
@@ -727,12 +693,9 @@ Panel {
               }
             }
 
-            Text {
+            DpiText {
               width: parent.width
               text: root.progress.current ? root.progress.current : "готовим первую стратегию…"
-              color: root.dim
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.caption
               elide: Text.ElideRight
             }
           }
@@ -752,16 +715,13 @@ Panel {
             Repeater {
               model: root.strategies.slice(0, 3)
 
-              Button {
+              DpiButton {
                 required property var modelData
                 width: body.width
                 leftAlign: true
-                bordered: modelData.id === (root.st && root.st.active_id ? root.st.active_id : "")
-                selected: modelData.id === (root.st && root.st.active_id ? root.st.active_id : "")
+                bordered: modelData.id === root.activeId
+                selected: modelData.id === root.activeId
                 text: modelData.name + "  ·  " + modelData.passed + "/" + modelData.total
-                foreground: root.foreground
-                accent: root.accent
-                fontFamily: root.fontFamily
                 fontSize: Style.font.bodySmall
                 horizontalPadding: Style.space(8)
                 verticalPadding: Style.space(5)
@@ -771,34 +731,27 @@ Panel {
           }
 
           // ------------------------------------------------------- notices
-          Text {
+          DpiText {
             width: parent.width
             visible: root.errorText !== ""
             text: root.errorText
             color: root.urgent
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.caption
-            wrapMode: Text.WordWrap
+            wrap: true
           }
 
-          Text {
+          DpiText {
             width: parent.width
             visible: root.conflict && root.installed
             text: "Одновременно работает omarchy-zapret2. Оставьте включённым только один обход: два nfqws2 перехватывают одни и те же пакеты."
-            color: root.dim
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.caption
-            wrapMode: Text.WordWrap
+            wrap: true
           }
 
-          Text {
+          DpiText {
             width: parent.width
             visible: root.flashText !== ""
             text: root.flashText
             color: root.accent
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.caption
-            wrapMode: Text.WordWrap
+            wrap: true
           }
 
           // ------------------------------------------------------ advanced
@@ -809,14 +762,12 @@ Panel {
 
             PanelSeparator { foreground: root.foreground }
 
-            Button {
+            DpiButton {
               width: parent.width
               leftAlign: true
               bordered: false
               text: root.advanced ? "Свернуть" : "Дополнительно"
               foreground: root.dim
-              accent: root.accent
-              fontFamily: root.fontFamily
               fontSize: Style.font.bodySmall
               horizontalPadding: 0
               verticalPadding: Style.space(2)
@@ -828,51 +779,39 @@ Panel {
               spacing: Style.space(6)
               visible: root.advanced
 
-              Text {
+              DpiText {
                 width: parent.width
                 text: "Движок: " + (root.engine !== "" ? root.engine : "—")
                   + " · nfqws2 · очередь " + 230
-                color: root.dim
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-                wrapMode: Text.WordWrap
+                wrap: true
               }
 
-              Text {
+              DpiText {
                 width: parent.width
                 text: "Обход применяется ко всему трафику — списки и исключения не нужны. Если что-то не работает: journalctl -u kich-dpi -f"
                 color: root.faint
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-                wrapMode: Text.WordWrap
+                wrap: true
               }
 
-              Button {
+              DpiButton {
                 width: parent.width
                 leftAlign: true
                 bordered: true
                 text: "Обновить движок"
                 enabled: !root.busy
-                opacity: enabled ? 1 : 0.55
-                foreground: root.foreground
-                accent: root.accent
-                fontFamily: root.fontFamily
                 fontSize: Style.font.bodySmall
                 horizontalPadding: Style.space(8)
                 verticalPadding: Style.space(5)
                 onClicked: root.updateEngine()
               }
 
-              Button {
+              DpiButton {
                 width: parent.width
                 leftAlign: true
                 bordered: true
                 text: root.armRemove ? "Точно удалить?" : "Удалить движок"
                 enabled: !root.busy
-                opacity: enabled ? 1 : 0.55
                 foreground: root.armRemove ? root.urgent : root.foreground
-                accent: root.accent
-                fontFamily: root.fontFamily
                 fontSize: Style.font.bodySmall
                 horizontalPadding: Style.space(8)
                 verticalPadding: Style.space(5)

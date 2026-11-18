@@ -294,13 +294,31 @@ class WarpTest(unittest.TestCase):
         self.assertFalse(result["tun"])
 
     def test_warp_unit_validates_the_config_before_start(self):
-        text = self.mod.WARP_UNIT_TEMPLATE.format(user="u", group="g", home="/home/u")
+        text = self.mod.unit_text(self.mod.WARP_UNIT_TEMPLATE, "/home/u", user="u", group="g")
         lines = text.splitlines()
         pre = [i for i, line in enumerate(lines) if line.startswith("ExecStartPre=")]
         start = [i for i, line in enumerate(lines) if line.startswith("ExecStart=")]
         self.assertTrue(pre, "WARP unit must validate the generated YAML")
         self.assertIn(" -t ", lines[pre[0]])
         self.assertLess(pre[0], start[0])
+
+    def test_unit_templates_render_shared_hardening(self):
+        shared = (
+            "ProtectSystem=strict",
+            "ProtectHome=read-only",
+            "PrivateTmp=yes",
+            "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK",
+            "LimitNOFILE=65535",
+        )
+        for template in (self.mod.UNIT_TEMPLATE, self.mod.WARP_UNIT_TEMPLATE):
+            lines = self.mod.unit_text(template, "/home/u", user="u", group="g").splitlines()
+            self.assertFalse([line for line in lines if "{" in line])
+            for line in shared:
+                self.assertIn(line, lines)
+        self.assertIn("PrivateDevices=yes", self.mod.unit_text(
+            self.mod.UNIT_TEMPLATE, "/home/u", user="u", group="g").splitlines())
+        self.assertIn("DeviceAllow=/dev/net/tun rw", self.mod.unit_text(
+            self.mod.WARP_UNIT_TEMPLATE, "/home/u", user="u", group="g").splitlines())
 
 
     def test_missing_account_is_rejected(self):
@@ -481,7 +499,7 @@ class StateTest(unittest.TestCase):
     def test_status_shape_without_engine(self):
         from unittest import mock
         self.mod.installed_version = lambda: ""
-        self.mod.unit_state = lambda: ("inactive", "not-found")
+        self.mod.unit_state = lambda *a, **k: ("inactive", "not-found")
         with mock.patch.object(self.mod.subprocess, "run",
                                return_value=subprocess.CompletedProcess(["systemctl"], 1, "", "")):
             data = self.mod.status_data()

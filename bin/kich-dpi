@@ -146,6 +146,16 @@ def read_json(path, fallback):
         return fallback
 
 
+def read_dict(path):
+    data = read_json(path, {})
+    return data if isinstance(data, dict) else {}
+
+
+def read_list(path):
+    data = read_json(path, [])
+    return data if isinstance(data, list) else []
+
+
 def write_json(path, data):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -202,8 +212,7 @@ def engine_lua(name):
 
 
 def installed_version():
-    info = read_json(ENGINE_ROOT / "install.json", {})
-    version = info.get("version") if isinstance(info, dict) else ""
+    version = read_dict(ENGINE_ROOT / "install.json").get("version") or ""
     if version and engine_bin().exists():
         return str(version)
     if engine_bin().exists():
@@ -216,21 +225,32 @@ def installed():
         and engine_lua("zapret-antidpi.lua").exists()
 
 
-def systemctl(*args, timeout=25):
+def systemctl(*args, timeout=25, unit=UNIT):
     try:
         return subprocess.run(
-            ["systemctl", *args, UNIT],
+            ["systemctl", *args, unit],
             capture_output=True, text=True, timeout=timeout,
         )
     except (OSError, subprocess.SubprocessError) as exc:
-        return subprocess.CompletedProcess(["systemctl", *args, UNIT], 1, "", str(exc))
+        return subprocess.CompletedProcess(["systemctl", *args, unit], 1, "", str(exc))
 
 
-def unit_state():
-    if not UNIT_PATH.exists() and not installed():
+def service_active(unit):
+    """True when a unit is active; any failure to ask counts as inactive."""
+    try:
+        return subprocess.run(["systemctl", "is-active", unit], capture_output=True,
+                              text=True, timeout=4).stdout.strip() == "active"
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def unit_state(unit=UNIT, path=UNIT_PATH, missing_ok=True):
+    """(active, enabled) for a unit. `missing_ok` keeps an installed engine
+    reporting a real state even while its unit file is not written yet."""
+    if not path.exists() and not (missing_ok and installed()):
         return "inactive", "not-found"
-    active = systemctl("is-active").stdout.strip() or "inactive"
-    enabled = systemctl("is-enabled").stdout.strip() or "disabled"
+    active = systemctl("is-active", unit=unit).stdout.strip() or "inactive"
+    enabled = systemctl("is-enabled", unit=unit).stdout.strip() or "disabled"
     return active, enabled
 
 
@@ -397,9 +417,8 @@ def probe(targets=TARGETS, timeout=7):
             code = int(parts[0]) if parts and parts[0].isdigit() else 0
             elapsed = float(parts[1]) if len(parts) > 1 else (time.monotonic() - started)
             ok = cp.returncode == 0 and 200 <= code < 400
-            error = "" if ok else (cp.stderr or "").strip().splitlines()[-1:] or ""
-            if isinstance(error, list):
-                error = error[0] if error else ""
+            error = "" if ok else (cp.stderr or "").strip()
+            error = error.splitlines()[-1] if error else ""
         except (OSError, subprocess.SubprocessError, ValueError) as exc:
             code, elapsed, ok, error = 0, time.monotonic() - started, False, str(exc)
         results.append({
@@ -428,22 +447,17 @@ def score(result):
     return (int(result["passed"]), -int(result.get("ms") or 10 ** 9))
 
 
-def result_line(result):
-    return "%d/%d · %.1f с" % (
-        int(result.get("passed") or 0),
-        int(result.get("total") or 0),
-        (int(result.get("ms") or 0) / 1000.0) if result.get("passed") else 0,
-    )
-
-
 # ------------------------------------------------------------------- install
 
+def http_request(url, method="GET", json_api=False):
+    headers = {"User-Agent": "kich-dpi/%s" % VERSION}
+    if json_api:
+        headers["Accept"] = "application/vnd.github+json"
+    return urllib.request.Request(url, headers=headers, method=method)
+
+
 def release_info():
-    req = urllib.request.Request(RELEASE_API, headers={
-        "User-Agent": "kich-dpi/%s" % VERSION,
-        "Accept": "application/vnd.github+json",
-    })
-    with urllib.request.urlopen(req, timeout=30) as resp:
+    with urllib.request.urlopen(http_request(RELEASE_API, json_api=True), timeout=30) as resp:
         data = json.load(resp)
     tag = str(data.get("tag_name") or "")
     assets = {str(a.get("name")): a for a in data.get("assets") or []}
@@ -455,8 +469,7 @@ def release_info():
 
 
 def download(url, dest):
-    req = urllib.request.Request(url, headers={"User-Agent": "kich-dpi/%s" % VERSION})
-    with urllib.request.urlopen(req, timeout=120) as resp, open(dest, "wb") as fh:
+    with urllib.request.urlopen(http_request(url), timeout=120) as resp, open(dest, "wb") as fh:
         shutil.copyfileobj(resp, fh, 1024 * 256)
 
 
@@ -523,9 +536,8 @@ def extract_engine(archive, tag):
 def github_latest_tag(repo):
     """Resolve the latest release tag without the API (which is rate limited)."""
     url = "https://github.com/%s/releases/latest" % repo
-    req = urllib.request.Request(url, headers={"User-Agent": "kich-dpi/%s" % VERSION})
     try:
-        with urllib.request.urlopen(req, timeout=25) as resp:
+        with urllib.request.urlopen(http_request(url), timeout=25) as resp:
             final = resp.geturl()
     except urllib.error.HTTPError as exc:
         raise Fail("GitHub ответил HTTP %s" % exc.code)
@@ -541,29 +553,27 @@ def mihomo_release():
     arch = {"x86_64": "amd64", "arm64": "arm64"}.get(machine_arch())
     if not arch:
         raise Fail("нет сборки mihomo для архитектуры %s" % machine_arch())
+    api = "https://api.github.com/repos/MetaCubeX/mihomo/releases/latest"
     tag = ""
     digest = ""
     try:
-        req = urllib.request.Request(
-            "https://api.github.com/repos/MetaCubeX/mihomo/releases/latest",
-            headers={"User-Agent": "kich-dpi/%s" % VERSION, "Accept": "application/vnd.github+json"},
-        )
-        with urllib.request.urlopen(req, timeout=25) as resp:
+        with urllib.request.urlopen(http_request(api, json_api=True), timeout=25) as resp:
             data = json.load(resp)
         tag = str(data.get("tag_name") or "")
         assets = {str(asset.get("name")): asset for asset in data.get("assets") or []}
-        for name in ("mihomo-linux-%s-compatible-%s.gz" % (arch, tag),
-                     "mihomo-linux-%s-%s.gz" % (arch, tag)):
-            asset = assets.get(name)
-            if asset:
-                return tag, str(asset.get("browser_download_url") or ""), \
-                    str(asset.get("digest") or "")
     except Exception:
-        pass  # fall through to the redirect-based resolution below
+        assets = {}  # fall through to the redirect-based resolution below
     if not tag:
         tag = github_latest_tag("MetaCubeX/mihomo")
-    for name in ("mihomo-linux-%s-compatible-%s.gz" % (arch, tag),
-                 "mihomo-linux-%s-%s.gz" % (arch, tag)):
+    # "compatible" is a static build for older CPUs; prefer it when present.
+    names = ("mihomo-linux-%s-compatible-%s.gz" % (arch, tag),
+             "mihomo-linux-%s-%s.gz" % (arch, tag))
+    for name in names:
+        asset = assets.get(name)
+        if asset:
+            return tag, str(asset.get("browser_download_url") or ""), \
+                str(asset.get("digest") or "")
+    for name in names:
         url = "https://github.com/MetaCubeX/mihomo/releases/download/%s/%s" % (tag, name)
         if remote_exists(url):
             return tag, url, digest
@@ -571,10 +581,8 @@ def mihomo_release():
 
 
 def remote_exists(url):
-    req = urllib.request.Request(url, method="HEAD",
-                                 headers={"User-Agent": "kich-dpi/%s" % VERSION})
     try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
+        with urllib.request.urlopen(http_request(url, method="HEAD"), timeout=20) as resp:
             return resp.status == 200
     except Exception:
         return False
@@ -623,8 +631,7 @@ def install_mihomo():
 
 
 def mihomo_version():
-    info = read_json(ENGINE_ROOT / "mihomo.json", {})
-    return str(info.get("version") or "") if isinstance(info, dict) else ""
+    return str(read_dict(ENGINE_ROOT / "mihomo.json").get("version") or "")
 
 
 def write_text(path, text, mode=0o644):
@@ -635,6 +642,33 @@ def write_text(path, text, mode=0o644):
         fh.write(text)
     os.chmod(tmp, mode)
     os.replace(tmp, path)
+
+
+
+UNIT_GUARDS = """ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=-{home}/.config/kich-dpi -{home}/.local/state/kich-dpi
+PrivateTmp=yes
+"""
+
+UNIT_HARDENING = """ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+LimitNOFILE=65535
+"""
+
+
+def unit_text(template, home, **fields):
+    return template.format(
+        home=home, guards=UNIT_GUARDS.format(home=home),
+        hardening=UNIT_HARDENING, **fields,
+    )
 
 
 UNIT_TEMPLATE = """# Installed by kich-dpi (Omarchy plugin). Removed by `kich-dpi remove`.
@@ -659,22 +693,10 @@ TimeoutStopSec=6
 NoNewPrivileges=yes
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
-ProtectSystem=strict
-ProtectHome=read-only
-ReadWritePaths=-{home}/.config/kich-dpi -{home}/.local/state/kich-dpi
-PrivateTmp=yes
+{guards}
 PrivateDevices=yes
 ProtectKernelTunables=yes
-ProtectKernelModules=yes
-ProtectKernelLogs=yes
-ProtectControlGroups=yes
-ProtectClock=yes
-ProtectHostname=yes
-RestrictRealtime=yes
-RestrictSUIDSGID=yes
-LockPersonality=yes
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
-LimitNOFILE=65535
+{hardening}
 
 [Install]
 WantedBy=multi-user.target
@@ -714,23 +736,11 @@ TimeoutStopSec=10
 NoNewPrivileges=yes
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+{guards}
 PrivateDevices=no
 DeviceAllow=/dev/net/tun rw
-ProtectSystem=strict
-ProtectHome=read-only
-ReadWritePaths=-{home}/.config/kich-dpi -{home}/.local/state/kich-dpi
-PrivateTmp=yes
 ProtectKernelTunables=no
-ProtectKernelModules=yes
-ProtectKernelLogs=yes
-ProtectControlGroups=yes
-ProtectClock=yes
-ProtectHostname=yes
-RestrictRealtime=yes
-RestrictSUIDSGID=yes
-LockPersonality=yes
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
-LimitNOFILE=65535
+{hardening}
 
 [Install]
 WantedBy=multi-user.target
@@ -759,11 +769,11 @@ def install_system(user):
     except KeyError:
         group = user.pw_name
     home = Path(user.pw_dir)
-    write_text(UNIT_PATH, UNIT_TEMPLATE.format(
-        user=user.pw_name, group=group, home=user.pw_dir,
+    write_text(UNIT_PATH, unit_text(
+        UNIT_TEMPLATE, user.pw_dir, user=user.pw_name, group=group,
     ))
-    write_text(WARP_UNIT_PATH, WARP_UNIT_TEMPLATE.format(
-        user=user.pw_name, group=group, home=user.pw_dir,
+    write_text(WARP_UNIT_PATH, unit_text(
+        WARP_UNIT_TEMPLATE, user.pw_dir, user=user.pw_name, group=group,
     ))
     write_text(POLKIT_PATH, POLKIT_TEMPLATE.format(
         user=user.pw_name, unit=UNIT, warp_unit=WARP_UNIT,
@@ -933,27 +943,15 @@ def warp_available():
 
 
 def warp_systemctl(*args, timeout=25):
-    try:
-        return subprocess.run(
-            ["systemctl", *args, WARP_UNIT],
-            capture_output=True, text=True, timeout=timeout,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        return subprocess.CompletedProcess(["systemctl", *args, WARP_UNIT], 1, "", str(exc))
+    return systemctl(*args, timeout=timeout, unit=WARP_UNIT)
 
 
 def warp_unit_state():
-    if not WARP_UNIT_PATH.exists():
-        return "inactive", "not-found"
-    active = warp_systemctl("is-active").stdout.strip() or "inactive"
-    enabled = warp_systemctl("is-enabled").stdout.strip() or "disabled"
-    return active, enabled
+    return unit_state(WARP_UNIT, WARP_UNIT_PATH, missing_ok=False)
 
 
 def warp_account():
-    data = read_json(WARP_ACCOUNT, {})
-    if not isinstance(data, dict):
-        return {}
+    data = read_dict(WARP_ACCOUNT)
     needed = ("private_key", "endpoint_pub_key", "id", "access_token")
     if any(not str(data.get(key) or "").strip() for key in needed):
         return {}
@@ -1350,26 +1348,16 @@ def warp_build(account=None):
 
 
 def warp_conflict():
-    try:
-        cp = subprocess.run(["systemctl", "is-active", "omarchy-usque.service"],
-                            capture_output=True, text=True, timeout=4)
-        if cp.stdout.strip() == "active":
-            return "туннель omarchy-usque активен"
-    except (OSError, subprocess.SubprocessError):
-        pass
+    if service_active("omarchy-usque.service"):
+        return "туннель omarchy-usque активен"
     return ""
-
-
-def warp_check_data():
-    data = read_json(WARP_CHECK_FILE, {})
-    return data if isinstance(data, dict) else {}
 
 
 def warp_status():
     active, enabled = warp_unit_state()
     account = warp_account()
     conflict = warp_conflict()
-    check = warp_check_data()
+    check = read_dict(WARP_CHECK_FILE)
     error = ""
     if not warp_available():
         error = "mihomo не установлен"
@@ -1506,9 +1494,7 @@ def cmd_warp_check():
 # -------------------------------------------------------------------- state
 
 def progress_data():
-    data = read_json(PROGRESS_FILE, {})
-    if not isinstance(data, dict):
-        return {}
+    data = read_dict(PROGRESS_FILE)
     if data.get("running") and time.time() - int(data.get("started") or 0) > 1800:
         data["running"] = False
         data["error"] = "подбор прерван"
@@ -1520,17 +1506,11 @@ def status_data():
     active, enabled = unit_state()
     running = active == "active"
     failed = active == "failed"
-    active_doc = read_json(ACTIVE_FILE, {})
-    if not isinstance(active_doc, dict):
-        active_doc = {}
+    active_doc = read_dict(ACTIVE_FILE)
     spec = active_doc.get("spec") if isinstance(active_doc.get("spec"), dict) else {}
-    check = read_json(CHECK_FILE, {})
-    if not isinstance(check, dict):
-        check = {}
+    check = read_dict(CHECK_FILE)
     progress = progress_data()
-    saved = read_json(STRATEGIES_FILE, [])
-    if not isinstance(saved, list):
-        saved = []
+    saved = read_list(STRATEGIES_FILE)
 
     rows = []
     for item in saved:
@@ -1546,13 +1526,7 @@ def status_data():
         })
     rows.sort(key=lambda r: (-r["passed"], r["ms"]))
 
-    other = False
-    try:
-        cp = subprocess.run(["systemctl", "is-active", "omarchy-zapret2.service"],
-                            capture_output=True, text=True, timeout=4)
-        other = cp.stdout.strip() == "active"
-    except (OSError, subprocess.SubprocessError):
-        pass
+    other = service_active("omarchy-zapret2.service")
 
     error = ""
     if not installed():
@@ -1643,13 +1617,11 @@ def cmd_check():
 
 
 def cmd_use(strategy_id_arg):
-    saved = read_json(STRATEGIES_FILE, [])
     spec = None
-    if isinstance(saved, list):
-        for item in saved:
-            if isinstance(item, dict) and str(item.get("id")) == str(strategy_id_arg):
-                spec = item.get("spec")
-                break
+    for item in read_list(STRATEGIES_FILE):
+        if isinstance(item, dict) and str(item.get("id")) == str(strategy_id_arg):
+            spec = item.get("spec")
+            break
     if not isinstance(spec, dict):
         raise Fail("стратегия не найдена")
     apply_spec(spec, start=True)
@@ -1657,11 +1629,8 @@ def cmd_use(strategy_id_arg):
 
 
 def merge_strategies(rows):
-    saved = read_json(STRATEGIES_FILE, [])
-    if not isinstance(saved, list):
-        saved = []
     by_id = {}
-    for item in saved:
+    for item in read_list(STRATEGIES_FILE):
         if isinstance(item, dict) and item.get("id"):
             by_id[str(item["id"])] = item
     for item in rows:
@@ -1689,7 +1658,7 @@ def cmd_generate():
         raise Fail("подбор уже идёт")
 
     was_running = is_running()
-    original_doc = read_json(ACTIVE_FILE, {})
+    original_doc = read_dict(ACTIVE_FILE)
     original = original_doc.get("spec") if isinstance(original_doc.get("spec"), dict) else None
     fallback = original if original else default_spec()
 
@@ -1705,18 +1674,17 @@ def cmd_generate():
     }
     write_json(PROGRESS_FILE, progress)
 
+    def save_progress(**fields):
+        progress.update(fields)
+        write_json(PROGRESS_FILE, progress)
+
     baseline = None
     best = None
     rows = []
     try:
         baseline = probe()
         for index, spec in enumerate(candidates(), 1):
-            progress.update({
-                "running": True,
-                "done": index - 1,
-                "current": strategy_name(spec),
-            })
-            write_json(PROGRESS_FILE, progress)
+            save_progress(running=True, done=index - 1, current=strategy_name(spec))
 
             error = ""
             try:
@@ -1748,8 +1716,7 @@ def cmd_generate():
                     "total": result["total"],
                     "ms": result["ms"],
                 }
-            progress["done"] = index
-            write_json(PROGRESS_FILE, progress)
+            save_progress(done=index)
     finally:
         # Always leave a working configuration behind, even after Ctrl+C.
         keep_original = False
@@ -1782,7 +1749,7 @@ def cmd_generate():
         write_json(PROGRESS_FILE, progress)
         lock.close()
 
-    final = baseline if baseline is not None else read_json(CHECK_FILE, {})
+    final = baseline if baseline is not None else read_dict(CHECK_FILE)
     if not progress.get("kept_original") and best is not None:
         final = best[1]
     if isinstance(final, dict) and final:
@@ -1882,7 +1849,7 @@ def cmd__run():
     if not installed():
         log("kich-dpi: engine is not installed")
         return 1
-    active_doc = read_json(ACTIVE_FILE, {})
+    active_doc = read_dict(ACTIVE_FILE)
     spec = active_doc.get("spec") if isinstance(active_doc.get("spec"), dict) else default_spec()
     conf = RUN_DIR / "nfqws2.conf"
     try:
@@ -1927,16 +1894,16 @@ def cmd__run():
 # --------------------------------------------------------------- diagnostics
 
 def cmd_logs(count):
+    count = max(1, int(count))
     try:
         cp = subprocess.run(
-            ["journalctl", "-u", UNIT, "-n", str(max(1, int(count))),
-             "--no-pager", "-o", "cat"],
+            ["journalctl", "-u", UNIT, "-n", str(count), "--no-pager", "-o", "cat"],
             capture_output=True, text=True, timeout=15,
         )
         lines = [line for line in cp.stdout.splitlines() if line.strip()]
     except (OSError, subprocess.SubprocessError) as exc:
         lines = ["journalctl: %s" % exc]
-    out({"ok": True, "lines": lines[-max(1, int(count)):]})
+    out({"ok": True, "lines": lines[-count:]})
 
 
 def cmd_doctor():
