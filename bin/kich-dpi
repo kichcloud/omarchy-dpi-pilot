@@ -34,7 +34,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-VERSION = "0.4.2"
+VERSION = "0.4.3"
 
 UNIT = "kich-dpi.service"
 TABLE = "kich_dpi"
@@ -1379,7 +1379,7 @@ def warp_config_text(account):
         add("    type: file")
         add("    behavior: domain")
         add("    format: text")
-        add("    path: %s" % yaml_str(WARP_USER_DOMAINS))
+        add("    path: %s" % yaml_str(WARP_RULES / "direct-domains.txt"))
     add("rules:")
     # A process rule wins over everything else: that is the point of listing it.
     for name in processes:
@@ -1404,6 +1404,24 @@ def warp_config_text(account):
     return "\n".join(lines)
 
 
+def domain_payload(text):
+    """Turn a plain domain list into a mihomo `domain` payload.
+
+    mihomo matches a bare entry in `behavior: domain` as an exact name, so
+    `yandex.net` never covered `api.music.yandex.net`: the connection fell
+    through to `MATCH,WARP` and Russian music traffic left through the tunnel.
+    The `+.` prefix asks for suffix matching, the same way `DOMAIN-SUFFIX` does.
+    """
+    out = []
+    for line in text.splitlines():
+        item = line.strip()
+        if not item or item.startswith("#") or item.startswith(("+.", "*.")):
+            out.append(line)
+            continue
+        out.append("+." + item)
+    return "\n".join(out) + "\n"
+
+
 def install_rule_lists():
     """Copy the shipped lists where mihomo is allowed to read them."""
     missing = []
@@ -1413,10 +1431,16 @@ def install_rule_lists():
         if not src.is_file():
             missing.append(name)
             continue
-        write_text(WARP_RULES / name, src.read_text(encoding="utf-8"), 0o644)
+        text = src.read_text(encoding="utf-8")
+        if name == "ru-domain.txt":
+            text = domain_payload(text)
+        write_text(WARP_RULES / name, text, 0o644)
     if missing:
         raise Fail("нет списков правил (%s): обновите системную часть плагина"
                    % ", ".join(missing))
+    # The editable list stays plain; mihomo reads this generated copy.
+    write_text(WARP_RULES / "direct-domains.txt",
+               domain_payload("\n".join(list_lines(WARP_USER_DOMAINS))), 0o644)
 
 
 def ensure_user_lists():
@@ -1431,8 +1455,8 @@ def warp_build(account=None):
     account = account or warp_account()
     if not account:
         raise Fail("WARP ещё не зарегистрирован")
-    install_rule_lists()
     ensure_user_lists()
+    install_rule_lists()
     text = warp_config_text(account)
     write_text(WARP_CONFIG, text, 0o600)
     return WARP_CONFIG

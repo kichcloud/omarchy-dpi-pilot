@@ -208,12 +208,28 @@ class WarpTest(unittest.TestCase):
             self.skipTest("pyyaml is not installed")
         self.mod.WARP_USER_DOMAINS.write_text("# своё\nmy.example\n", encoding="utf-8")
         self.mod.WARP_USER_PROCESSES.write_text("telegram\n", encoding="utf-8")
+        self.mod.install_rule_lists()
         data = yaml.safe_load(self.mod.warp_config_text(self.ACCOUNT))
         self.assertEqual(data["find-process-mode"], "strict")
         self.assertEqual(data["rules"][0], "PROCESS-NAME,telegram,DIRECT")
         self.assertIn("RULE-SET,direct-domains,DIRECT", data["rules"])
-        self.assertEqual(data["rule-providers"]["direct-domains"]["path"],
-                         str(self.mod.WARP_USER_DOMAINS))
+        # mihomo reads the generated copy, where every entry carries `+.`.
+        payload = pathlib.Path(data["rule-providers"]["direct-domains"]["path"])
+        self.assertEqual(payload, self.mod.WARP_RULES / "direct-domains.txt")
+        self.assertEqual(payload.read_text(encoding="utf-8"), "+.my.example\n")
+
+    def test_domain_lists_use_suffix_matching(self):
+        # A bare entry matches one exact host, so subdomains slipped to WARP.
+        payload = (self.mod.WARP_RULES / "ru-domain.txt").read_text(encoding="utf-8")
+        self.assertIn("\n+.yandex.net\n", payload)
+        self.assertIn("\n+.ya.ru\n", payload)
+        self.assertNotIn("\nyandex.net\n", payload)
+        for line in payload.splitlines():
+            if not line or line.startswith("#"):
+                continue
+            self.assertTrue(line.startswith("+."), line)
+        self.assertEqual(self.mod.domain_payload("a.ru\n\n# x\n+.b.ru\n"),
+                         "+.a.ru\n\n# x\n+.b.ru\n")
 
     def test_comma_in_process_name_is_rejected(self):
         self.mod.WARP_USER_PROCESSES.write_text("bad,name\n", encoding="utf-8")
