@@ -233,18 +233,26 @@ def engine_lua(name):
     return ENGINE_DIR / "current" / "lua" / name
 
 
-def installed_version():
+def engine_info():
+    """(version, installed) from a single pass of file checks.
+
+    `status` used to stat the engine and read install.json twice per poll (via
+    installed_version() and installed()). Both helpers now share this one pass.
+    """
     version = read_dict(ENGINE_ROOT / "install.json").get("version") or ""
-    if version and engine_bin().exists():
-        return str(version)
-    if engine_bin().exists():
-        return "установлен"
-    return ""
+    if not engine_bin().exists():
+        return "", False
+    version = str(version) if version else "установлен"
+    return version, (engine_lua("zapret-lib.lua").exists()
+                     and engine_lua("zapret-antidpi.lua").exists())
+
+
+def installed_version():
+    return engine_info()[0]
 
 
 def installed():
-    return bool(installed_version()) and engine_lua("zapret-lib.lua").exists() \
-        and engine_lua("zapret-antidpi.lua").exists()
+    return engine_info()[1]
 
 
 def systemctl(*args, timeout=25, unit=UNIT):
@@ -586,10 +594,11 @@ def http_probe(url, timeout, interface=""):
     return ok, code, int(round(elapsed * 1000)), error[:160]
 
 
-def probe(targets=TARGETS, timeout=7, direct=False):
+def probe(targets=TARGETS, timeout=7, direct=False, interface=None):
+    """`interface` lets a caller reuse one device lookup across many probes."""
     if not curl_available():
         raise Fail("не найден curl")
-    device = direct_device() if direct else ""
+    device = interface if interface is not None else (direct_device() if direct else "")
     results = []
     for key, label, url in targets:
         ok, code, ms, error = http_probe(url, timeout, device)
@@ -614,9 +623,10 @@ def probe(targets=TARGETS, timeout=7, direct=False):
     }
 
 
-def sanity(timeout=6):
+def sanity(timeout=6, device=None):
     """Reject a strategy that breaks TLS to hosts which are not blocked."""
-    device = direct_device()
+    if device is None:
+        device = direct_device()
     results = []
     for key, url in SANITY_TARGETS:
         ok, code, ms, error = http_probe(url, timeout, device)
@@ -1695,15 +1705,16 @@ def warp_status(_states=None):
         conflict = warp_conflict()
     account = warp_account()
     check = read_dict(WARP_CHECK_FILE)
+    available = warp_available()
     error = ""
-    if not warp_available():
+    if not available:
         error = "mihomo не установлен"
     elif conflict:
         error = conflict
     elif active == "failed":
         error = "служба WARP не запустилась"
     return {
-        "available": warp_available(),
+        "available": available,
         "registered": bool(account),
         "configured": WARP_CONFIG.exists(),
         "running": active == "active",
@@ -1847,7 +1858,7 @@ USQUE_UNIT = "omarchy-usque.service"
 
 
 def status_data():
-    version = installed_version()
+    version, is_installed = engine_info()
     # One systemctl call instead of six — see batched_unit_states().
     states = batched_unit_states([UNIT, WARP_UNIT, CONFLICT_UNIT, USQUE_UNIT])
     active, enabled = states[UNIT]
@@ -1876,7 +1887,7 @@ def status_data():
     other = states[CONFLICT_UNIT][0] == "active"
 
     error = ""
-    if not installed():
+    if not is_installed:
         error = "движок не установлен"
     elif failed:
         error = "служба не запустилась"
@@ -1884,7 +1895,7 @@ def status_data():
     return {
         "ok": True,
         "version": VERSION,
-        "installed": installed(),
+        "installed": is_installed,
         "engine": version,
         "unit": UNIT,
         "running": running,
@@ -2036,9 +2047,12 @@ def cmd_generate():
     baseline_health = (0, -10 ** 9)
     best = None
     rows = []
+    # One device lookup for the whole run: probe() and sanity() used to each
+    # spawn `ip route` for every one of the 21 candidates.
+    device = direct_device()
     try:
-        baseline = probe(direct=True)
-        baseline_check = sanity()
+        baseline = probe(interface=device)
+        baseline_check = sanity(device=device)
         baseline_health = (priority_health(baseline, baseline_check)
                            if baseline_check["ok"] else (0, -10 ** 9))
         for index, spec in enumerate(candidates(), 1):
@@ -2049,8 +2063,8 @@ def cmd_generate():
                 apply_spec(spec, start=True)
                 if not wait_active():
                     raise Fail("служба не запустилась")
-                result = probe(direct=True)
-                check = sanity()
+                result = probe(interface=device)
+                check = sanity(device=device)
                 if result["passed"] > 0 and not check["ok"]:
                     broken = ", ".join(row["label"] for row in check["results"]
                                        if not row["ok"])
@@ -2319,8 +2333,9 @@ def cmd_doctor():
     def add(name, ok, detail=""):
         checks.append({"name": name, "ok": bool(ok), "detail": str(detail)[:300]})
 
-    add("движок", installed(), installed_version())
-    if installed():
+    version, is_installed = engine_info()
+    add("движок", is_installed, version)
+    if is_installed:
         try:
             cp = subprocess.run([str(engine_bin()), "--version"],
                                 capture_output=True, text=True, timeout=10)

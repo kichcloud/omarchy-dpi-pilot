@@ -695,7 +695,7 @@ class StateTest(unittest.TestCase):
 
     def test_status_shape_without_engine(self):
         from unittest import mock
-        self.mod.installed_version = lambda: ""
+        self.mod.engine_info = lambda: ("", False)
         self.mod.unit_state = lambda *a, **k: ("inactive", "not-found")
         with mock.patch.object(self.mod.subprocess, "run",
                                return_value=subprocess.CompletedProcess(["systemctl"], 1, "", "")):

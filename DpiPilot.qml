@@ -1830,6 +1830,7 @@ Panel {
             root.dpiPending = ""
           }
         }
+        onDrawerGone: root.dpiDrawerItem = null
       }
     }
     }

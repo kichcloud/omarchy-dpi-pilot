@@ -21,6 +21,8 @@ Item {
   property bool expanded: false
   signal toggleRequested()
   signal drawerReady(var drawer)
+  signal drawerGone()
+  Component.onDestruction: drawerGone()
   width: parent ? parent.width : 0
 
   readonly property string bin: {
@@ -46,7 +48,6 @@ Item {
   property bool advanced: false
   property bool armRemove: false
 
-  readonly property var state: st
   readonly property bool installed: st !== null && st.installed === true
   readonly property bool running: st !== null && st.running === true
   readonly property bool failed: st !== null && st.failed === true
@@ -62,7 +63,6 @@ Item {
   readonly property bool warpRunning: warp.running === true
   readonly property bool warpRegistered: warp.registered === true
   readonly property string warpConflict: warp.conflict ? String(warp.conflict) : ""
-  readonly property string warpAccount: warp.account ? String(warp.account) : ""
   readonly property var warpCheck: warp.check ? warp.check : ({})
   function compactAddress(value) {
     var text = String(value || "")
@@ -99,16 +99,6 @@ Item {
     : failed ? "ошибка"
     : running ? "включён"
     : "выключен"
-
-  readonly property string tooltip: {
-    if (!reachable) return "DPI Pilot · менеджер не отвечает"
-    if (!installed) return "DPI Pilot · движок не установлен"
-    var text = "DPI Pilot · " + stateText
-    if (strategyName !== "") text += " · " + strategyName
-    if (check && check.passed !== undefined) text += " · " + check.passed + "/" + (check.total || 3)
-    if (warpRunning) text += " · WARP"
-    return text
-  }
 
   // Size to the drawer's Column so the host KeyboardPanel grows with us.
   implicitHeight: body.implicitHeight
@@ -160,6 +150,14 @@ Item {
     statusProc.running = true
   }
 
+  property bool readyEmitted: false
+
+  function ensureReady() {
+    if (readyEmitted) return
+    readyEmitted = true
+    drawerReady(this)
+  }
+
   function startAction(name, command, label) {
     if (actionProc.running) return
     actionError = ""
@@ -182,6 +180,13 @@ Item {
       actionError = parsed.error || "Не удалось выполнить"
     } else if (code !== 0) {
       actionError = shortError(err) || ("Код " + code)
+    } else if (name === "toggle") {
+      // cmd_toggle already answers with a full status object — applying it
+      // here avoids spawning a second `bin status` on every on/off.
+      if (parsed && parsed.ok === true && parsed.installed !== undefined) {
+        applyStatus(0, text, "")
+        return
+      }
     } else if (name === "generate") {
       if (parsed && parsed.error) actionError = parsed.error
       else if (parsed && parsed.best) {
@@ -195,12 +200,23 @@ Item {
       if (parsed && parsed.warp === false && parsed.warp_note)
         actionError = "mihomo: " + parsed.warp_note
     } else if (name === "warp") {
-      if (parsed && parsed.warp && parsed.warp.running === true) {
-        flash("WARP подключён")
-        startAction("warp-check", [bin, "warp-check"], "Проверка WARP…")
-      } else {
-        flash("WARP отключён")
+      if (parsed && parsed.warp) {
+        // warp-toggle already returns fresh WARP state; reuse it instead of
+        // re-reading every file through `bin status`.
+        if (st) {
+          var next = Object.assign({}, st)
+          next.warp = parsed.warp
+          st = next
+        }
+        if (parsed.warp.running === true) {
+          flash("WARP подключён")
+          startAction("warp-check", [bin, "warp-check"], "Проверка WARP…")
+        } else {
+          flash("WARP отключён")
+        }
+        return
       }
+      flash("WARP отключён")
     } else if (name === "warp-check") {
       if (parsed && parsed.check && parsed.check.ok)
         flash("WARP работает" + (parsed.check.ip ? " · " + root.compactAddress(parsed.check.ip) : ""))
@@ -265,11 +281,6 @@ Item {
     startAction("remove", ["pkexec", bin, "remove"], "Удаление…")
   }
 
-  Component.onCompleted: {
-    refresh()
-    drawerReady(this)
-  }
-
   Process {
     id: statusProc
     command: [root.bin, "status"]
@@ -277,6 +288,10 @@ Item {
     stderr: StdioCollector { id: statusErr }
     onExited: function(code) {
       root.applyStatus(code, String(statusOut.text || ""), String(statusErr.text || ""))
+      // Announce readiness only after a *successful* status reply, so an IPC
+      // action queued before the drawer loaded never runs against `st === null`
+      // (which would mistake a cold start for "engine not installed").
+      if (reachable) root.ensureReady()
     }
   }
 
@@ -290,9 +305,12 @@ Item {
   }
 
   Timer {
-    // Only poll often while the drawer is open; when collapsed (or when the
-    // popup itself is hidden) fall back to a slow keep-warm tick.
-    interval: root.visible && root.expanded ? (root.generating ? 900 : 2500) : 8000
+    id: statusTimer
+    // The host destroys the drawer when the popup closes, so there is no need
+    // for a "keep-warm" tick: triggeredOnStart already does the first refresh.
+    // Generating used to poll every 900 ms — 1.5 s keeps progress live while
+    // cutting status spawns by ~40% during a 21-strategy run.
+    interval: root.expanded ? (root.generating ? 1500 : 2500) : 8000
     running: true
     repeat: true
     triggeredOnStart: true
@@ -464,7 +482,7 @@ Item {
               anchors.verticalCenter: parent.verticalCenter
               iconText: "󰑐"
               iconSpinning: statusProc.running || root.busy
-              tooltipText: "Обновить (R)"
+              tooltipText: "Обновить"
               iconSize: Style.font.subtitle
               horizontalPadding: Style.space(4)
               verticalPadding: Style.space(3)
@@ -607,7 +625,7 @@ Item {
                 bordered: true
                 active: true
                 enabled: !root.busy && !root.generating
-                tooltipText: "Собрать стратегии, проверить их и оставить лучшую (G)"
+                tooltipText: "Собрать стратегии, проверить их и оставить лучшую"
                 onClicked: root.runGenerate()
               }
 
@@ -619,7 +637,7 @@ Item {
                 text: root.actionName === "check" ? "Проверка…" : "Проверить"
                 bordered: true
                 enabled: !root.busy && !root.generating
-                tooltipText: "Проверить текущее состояние (C)"
+                tooltipText: "Проверить текущее состояние"
                 onClicked: root.runCheck()
               }
             }
