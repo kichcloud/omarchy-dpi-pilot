@@ -180,12 +180,12 @@ omarchy-shell kich.dpi-pilot generate
 - Свои списки: `./kich-dpi warp-on` пересобирает конфиг и переустанавливает `rules/` из `/opt/kich-dpi/app/data/rules`. Если списков там нет (старая системная часть), команда прямо скажет обновиться.
 - После смены сети подбор стоит повторить: у разных провайдеров работают разные комбинации.
 - `setup` проверяет новую версию движка через GitHub API. Он без авторизации даёт только 60 запросов в час, поэтому при исчерпании лимита (HTTP 403) менеджер теперь определяет тег через `/releases/latest` без API и продолжает обновление — тревожное сообщение «сеть недоступна» при уже актуальном движке больше не появляется. Архив всё равно проверяется распаковкой.
-- Пока попап открыт, он опрашивает `status` каждые 2.5 с (0.9 с во время подбора, 8 с когда закрыт). Один опрос — это один процесс Python + **один** `systemctl show` на все четыре юнитов сразу. Раньше на каждый опрос уходило шесть отдельных `systemctl` (is-active/is-enabled для DPI, WARP и двух конфликтующих туннелей), и именно они, а не тумблеры, создавали больше всего процессов. Тесты отдельно проверяют, что `status_data()` делает ровно один `systemctl`-вызов.
+- Пока попап открыт, он опрашивает `status` каждые 2.5 с (1.5 с во время подбора; попап закрывается — drawer уничтожается и опрос останавливается). Один опрос — это один процесс Python + **один** `systemctl show` на все четыре юнитов сразу. Раньше на каждый опрос уходило шесть отдельных `systemctl` (is-active/is-enabled для DPI, WARP и двух конфликтующих туннелей), и именно они, а не тумблеры, создавали больше всего процессов. Тесты отдельно проверяют, что `status_data()` делает ровно один `systemctl`-вызов.
 
 ## Тесты
 
 ```bash
-python3 -m unittest discover -s tests -v
+python3 -m unittest discover -s . -p 'test_core.py' -v
 ```
 
 Тесты собирают конфигурации, проверяют уникальность стратегий и, если найден `nfqws2`, прогоняют каждую через `--dry-run`. Конфиг WARP проверяется как YAML, а при наличии бинарника — через `mihomo -t`. Отдельные тесты покрывают списки правил (домены и префиксы), режим `find-process-mode` при пустом и заполненном `direct-processes.txt`, отказ на запятую в имени процесса, проверку через прокси с флагом `tun` и наличие `ExecStartPre` перед `ExecStart`:
@@ -193,9 +193,9 @@ python3 -m unittest discover -s tests -v
 ```bash
 KICH_DPI_ENGINE_DIR=/opt/kich-dpi/engine/current \
 KICH_DPI_MIHOMO=/opt/kich-dpi/mihomo \
-python3 -m unittest discover -s tests -v
+python3 -m unittest discover -s . -p 'test_core.py' -v
 ```
 
 ## Лицензия
 
-Код плагина — MIT (см. `LICENSE`). Список `data/rules/ru-ip.txt` собран из данных пяти RIR, опубликованных под CC0 1.0 ([ipverse/country-ip-blocks](https://github.com/ipverse/country-ip-blocks)). Движок скачивается отдельно из [bol-van/zapret2](https://github.com/bol-van/zapret2); условия upstream-проекта смотрите в его репозитории.
+Код плагина — MIT (см. `LICENSE`). Список `ru-ip.txt` собран из данных пяти RIR, опубликованных под CC0 1.0 ([ipverse/country-ip-blocks](https://github.com/ipverse/country-ip-blocks)). Движок скачивается отдельно из [bol-van/zapret2](https://github.com/bol-van/zapret2); условия upstream-проекта смотрите в его репозитории.
