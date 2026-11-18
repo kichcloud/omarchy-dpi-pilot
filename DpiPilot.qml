@@ -52,9 +52,7 @@ Panel {
   readonly property var progress: st !== null && st.progress ? st.progress : ({})
   readonly property var check: st !== null && st.check ? st.check : ({})
   readonly property var results: check && check.results ? check.results : []
-  readonly property var strategies: st !== null && st.strategies ? st.strategies : []
   readonly property string strategyName: st !== null && st.active_name ? st.active_name : ""
-  readonly property string activeId: st !== null && st.active_id ? String(st.active_id) : ""
   readonly property string engine: st !== null && st.engine ? st.engine : ""
   readonly property bool conflict: st !== null && st.conflict === true
   readonly property var warp: st !== null && st.warp ? st.warp : ({})
@@ -210,8 +208,6 @@ Panel {
     } else if (name === "remove") {
       advanced = false
       flash("Системная часть удалена")
-    } else if (name === "use") {
-      flash("Стратегия применена")
     }
     refresh()
   }
@@ -265,12 +261,6 @@ Panel {
     }
     armRemove = false
     startAction("remove", ["pkexec", bin, "remove"], "Удаление…")
-  }
-
-  function useStrategy(id) {
-    if (!installed || id === "" || busy) return
-    if (id === (st && st.active_id ? st.active_id : "")) return
-    startAction("use", [bin, "use", id], "Применение…")
   }
 
   onOpenedChanged: if (opened) refresh()
@@ -631,8 +621,8 @@ Panel {
               spacing: Style.space(8)
 
               DpiButton {
-                Layout.fillWidth: true
-                width: (parent.width - parent.spacing) * 0.58
+                id: generateButton
+                width: (parent.width - parent.spacing) / 2
                 text: root.actionName === "generate" ? "Подбор…" : "Подобрать"
                 iconText: "󰒓"
                 bordered: true
@@ -643,7 +633,10 @@ Panel {
               }
 
               DpiButton {
-                width: parent.width - (parent.width - parent.spacing) * 0.58 - parent.spacing
+                width: (parent.width - parent.spacing) / 2
+                // The icon makes generateButton taller; mirror its height so
+                // both buttons are exactly the same size.
+                height: generateButton.height
                 text: root.actionName === "check" ? "Проверка…" : "Проверить"
                 bordered: true
                 enabled: !root.busy && !root.generating
@@ -697,36 +690,6 @@ Panel {
               width: parent.width
               text: root.progress.current ? root.progress.current : "готовим первую стратегию…"
               elide: Text.ElideRight
-            }
-          }
-
-          // ---------------------------------------------------- strategies
-          Column {
-            width: parent.width
-            spacing: Style.space(6)
-            visible: root.installed && !root.generating && root.strategies.length > 1
-
-            PanelSectionHeader {
-              text: "СОХРАНЁННЫЕ"
-              foreground: root.foreground
-              fontFamily: root.fontFamily
-            }
-
-            Repeater {
-              model: root.strategies.slice(0, 3)
-
-              DpiButton {
-                required property var modelData
-                width: body.width
-                leftAlign: true
-                bordered: modelData.id === root.activeId
-                selected: modelData.id === root.activeId
-                text: modelData.name + "  ·  " + modelData.passed + "/" + modelData.total
-                fontSize: Style.font.bodySmall
-                horizontalPadding: Style.space(8)
-                verticalPadding: Style.space(5)
-                onClicked: root.useStrategy(modelData.id)
-              }
             }
           }
 
@@ -788,7 +751,7 @@ Panel {
 
               DpiText {
                 width: parent.width
-                text: "Обход применяется ко всему трафику — списки и исключения не нужны. Если что-то не работает: journalctl -u kich-dpi -f"
+                text: "Обход применяется только к доменам из ~/.config/kich-dpi/dpi-domains.txt (включая поддомены). Пустой файл — обход всего трафика, как раньше. Журнал: journalctl -u kich-dpi -f"
                 color: root.faint
                 wrap: true
               }

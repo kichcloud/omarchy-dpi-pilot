@@ -34,7 +34,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-VERSION = "0.4.6"
+VERSION = "0.6.2"
 
 UNIT = "kich-dpi.service"
 TABLE = "kich_dpi"
@@ -61,7 +61,13 @@ TARGETS = (
 HOME = Path(os.environ.get("HOME") or pwd.getpwuid(os.getuid()).pw_dir)
 CONFIG_DIR = HOME / ".config" / ENGINE_SLUG
 STATE_DIR = HOME / ".local" / "state" / ENGINE_SLUG
+DPI_DOMAINS_FILE = CONFIG_DIR / "dpi-domains.txt"
+DPI_DOMAINS_DEFAULT = (
+    "discord.com", "discordapp.com", "youtube.com", "youtu.be",
+    "googlevideo.com", "ytimg.com", "ggpht.com",
+)
 ACTIVE_FILE = CONFIG_DIR / "active.json"
+STATE_FILE = CONFIG_DIR / "state.json"
 STRATEGIES_FILE = CONFIG_DIR / "strategies.json"
 CHECK_FILE = STATE_DIR / "check.json"
 PROGRESS_FILE = STATE_DIR / "progress.json"
@@ -70,6 +76,7 @@ PROGRESS_FILE = STATE_DIR / "progress.json"
 # the DPI path: mihomo owns the tunnel and its config is generated locally.
 WARP_UNIT = "kich-dpi-warp.service"
 WARP_UNIT_PATH = Path("/etc/systemd/system") / WARP_UNIT
+WARP_RUN = APP_DIR / "bin" / "kich-dpi-warp-run"
 MIHOMO = ENGINE_ROOT / "mihomo"
 WARP_CONFIG = CONFIG_DIR / "warp.yaml"
 WARP_ACCOUNT = STATE_DIR / "account.json"
@@ -165,6 +172,22 @@ def write_json(path, data):
     os.replace(tmp, path)
 
 
+def wanted_flags():
+    """Persistent toggle state, independent of systemd enablement."""
+    data = read_dict(STATE_FILE)
+    return {
+        "dpi": data.get("dpi", True),
+        "warp": data.get("warp", True),
+    }
+
+
+def set_wanted(key, value):
+    data = read_dict(STATE_FILE)
+    data["version"] = 1
+    data[key] = bool(value)
+    write_json(STATE_FILE, data)
+
+
 def require_root():
     if os.geteuid() != 0:
         raise Fail("нужен root: запустите через pkexec")
@@ -253,6 +276,39 @@ def unit_state(unit=UNIT, path=UNIT_PATH, missing_ok=True):
     return active, enabled
 
 
+def batched_unit_states(units):
+    """Active/enabled for several units from ONE `systemctl show` call.
+
+    A status poll used to spawn six `systemctl` processes (is-active and
+    is-enabled for DPI, WARP and the two conflicting tunnels). Quickshell
+    re-runs `status` every couple of seconds, so those forks — not the
+    toggles — dominate process churn. Coalescing them into a single query
+    keeps the CLI interface unchanged while cutting six spawns to one.
+    """
+    units = list(dict.fromkeys(units))  # stable order, no duplicates
+    result = {u: ("inactive", "not-found") for u in units}
+    if not units:
+        return result
+    try:
+        cp = subprocess.run(
+            ["systemctl", "show", *units,
+             "-p", "Id", "-p", "ActiveState", "-p", "UnitFileState", "--value"],
+            capture_output=True, text=True, timeout=12,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return result
+    for block in cp.stdout.split("\n\n"):
+        lines = [ln.strip() for ln in block.splitlines() if ln.strip()]
+        if len(lines) < 2:
+            continue
+        name, active = lines[0], lines[1] or "inactive"
+        # A missing unit prints only Id + ActiveState (empty UnitFileState).
+        enabled = (lines[2] if len(lines) >= 3 else "") or "not-found"
+        if name in result:
+            result[name] = (active, enabled)
+    return result
+
+
 def is_running():
     return unit_state()[0] == "active"
 
@@ -316,6 +372,18 @@ def candidates():
     add("fake + split · sld", "multisplit", "sld+1", "tcp_md5",
         quic="quic_google", quic_repeats=4)
 
+    # fakedsplit keeps Russian government TLS intact but plain tcp_md5 does
+    # not bypass Discord/AUR. Combine its pattern with the fooling primitives
+    # that work there, so the sanity check has a chance of passing all four.
+    add("fakedsplit · seq", "fakedsplit", "midsld", "tcp_seq", fake=None)
+    add("fakedsplit · noack", "fakedsplit", "midsld", "tcp_flags", fake=None)
+    add("fakedsplit at 1 · seq", "fakedsplit", "1", "tcp_seq", fake=None)
+    add("fakedsplit at 1 · noack", "fakedsplit", "1", "tcp_flags", fake=None)
+    add("fakeddisorder · seq", "fakeddisorder", "midsld", "tcp_seq", fake=None)
+    # The only variant measured to keep Discord, YouTube, AUR, Gosuslugi and
+    # both proxyapi endpoints reachable at the same time.
+    add("fakeddisorder at 2 · seq", "fakeddisorder", "2", "tcp_seq", fake=None)
+
     return result
 
 
@@ -329,6 +397,27 @@ def default_spec():
         if spec["name"] == "fakedsplit at 1":
             return spec
     return candidates()[-1]
+
+
+DPI_DOMAINS_HEADER = """# DPI desync applies only to these hosts (subdomains included).
+# One host per line; '#' starts a comment. Leave the file empty to desync
+# all TCP 80/443 and UDP 443 as older versions did.
+"""
+
+
+def dpi_domains():
+    """Hosts allowed to receive DPI desync; empty means global bypass."""
+    if not DPI_DOMAINS_FILE.exists():
+        return list(DPI_DOMAINS_DEFAULT)
+    try:
+        rows = []
+        for line in DPI_DOMAINS_FILE.read_text(encoding="utf-8").splitlines():
+            item = line.strip()
+            if item and not item.startswith("#"):
+                rows.append(item)
+        return rows
+    except OSError:
+        return list(DPI_DOMAINS_DEFAULT)
 
 
 def render_config(spec, dry_run=False):
@@ -394,6 +483,13 @@ def render_config(spec, dry_run=False):
         "--payload=quic_initial",
         "--lua-desync=fake:blob=%s:repeats=%d" % (quic, quic_repeats),
     ]
+    domains = dpi_domains()
+    if domains:
+        hostlist = "--hostlist-domains=" + ",".join(domains)
+        for l7 in ("http", "tls", "quic"):
+            marker = "--filter-l7=" + l7
+            if marker in lines:
+                lines.insert(lines.index(marker) + 1, hostlist)
     return "\n".join(lines) + "\n"
 
 
@@ -417,7 +513,29 @@ SANITY_TARGETS = (
     ("ya", "https://ya.ru/"),
     ("example", "https://example.com/"),
     ("aur", "https://aur.archlinux.org/"),
+    # The usual fake+split variants break its TLS, even though YouTube,
+    # Discord and AUR all pass. Without this guard a strategy can silently
+    # cut the user off from government services.
+    ("gosuslugi", "https://www.gosuslugi.ru/"),
+    # Both endpoints were lost with earlier DPI/MASQUE configs on this host;
+    # a strategy that drops them is not usable even if the three probes pass.
+    ("api-proxyapi", "https://api.proxyapi.ru/"),
+    ("console-proxyapi", "https://console.proxyapi.ru/"),
+    ("opencode", "https://opencode.ai/inference/openai/v1/models"),
 )
+
+
+# Which services actually matter when ranking two working strategies. A
+# strategy that keeps Google fast but loses the model API must not beat one
+# that keeps proxyapi/opencode/Discord/YouTube and is slightly slower.
+PRIORITY_WEIGHTS = {
+    "discord": 6,
+    "youtube": 6,
+    "api-proxyapi": 5,
+    "opencode": 5,
+    "console-proxyapi": 2,
+    "google": 1,
+}
 
 
 def default_device(text):
@@ -502,16 +620,36 @@ def sanity(timeout=6):
     results = []
     for key, url in SANITY_TARGETS:
         ok, code, ms, error = http_probe(url, timeout, device)
+        if not ok:
+            # A single timed-out request must not permanently reject a good
+            # strategy: government/proxy endpoints are prone to first-hit
+            # stalls, especially right after nfqws2 is restarted.
+            time.sleep(0.2)
+            ok, code, ms, error = http_probe(url, timeout, device)
         results.append({"key": key, "label": key, "ok": ok, "code": code,
                         "ms": ms, "error": error})
     return {"ok": all(row["ok"] for row in results), "device": device,
             "results": results}
 
 
-def score(result):
-    if not result.get("passed"):
+def priority_health(result, check):
+    """Weighted, latency-broken-down health of one measured strategy.
+
+    `result` comes from probe(), `check` from sanity(). The tuple compares
+    like `(points, -latency)`.
+    """
+    got = 0
+    for row in result.get("results", []):
+        weight = PRIORITY_WEIGHTS.get(row.get("key"), 0)
+        if weight and row.get("ok"):
+            got += weight
+    for row in check.get("results", []):
+        weight = PRIORITY_WEIGHTS.get(row.get("label"), 0)
+        if weight and row.get("ok"):
+            got += weight
+    if not got:
         return (0, -10 ** 9)
-    return (int(result["passed"]), -int(result.get("ms") or 10 ** 9))
+    return (got, -int(result.get("ms") or 10 ** 9))
 
 
 # ------------------------------------------------------------------- install
@@ -524,15 +662,29 @@ def http_request(url, method="GET", json_api=False):
 
 
 def release_info():
-    with urllib.request.urlopen(http_request(RELEASE_API, json_api=True), timeout=30) as resp:
-        data = json.load(resp)
-    tag = str(data.get("tag_name") or "")
-    assets = {str(a.get("name")): a for a in data.get("assets") or []}
-    name = "zapret2-%s.tar.gz" % tag
-    asset = assets.get(name)
-    if not tag or not asset:
-        raise Fail("в последнем релизе zapret2 нет %s" % name)
-    return tag, str(asset.get("browser_download_url") or ""), str(asset.get("digest") or "")
+    try:
+        with urllib.request.urlopen(http_request(RELEASE_API, json_api=True), timeout=30) as resp:
+            data = json.load(resp)
+        tag = str(data.get("tag_name") or "")
+        assets = {str(a.get("name")): a for a in data.get("assets") or []}
+        name = "zapret2-%s.tar.gz" % tag
+        asset = assets.get(name)
+        if not tag or not asset:
+            raise Fail("в последнем релизе zapret2 нет %s" % name)
+        return tag, str(asset.get("browser_download_url") or ""), str(asset.get("digest") or "")
+    except urllib.error.HTTPError as exc:
+        if exc.code != 403:
+            raise
+        # api.github.com allows only 60 unauthenticated requests per hour.
+        # The /releases/latest redirect is not rate limited, so resolve the
+        # tag there and build the asset URL ourselves. This keeps updates
+        # (and the no-op check when the engine is already current) working
+        # even right after the API quota is exhausted. No digest is published
+        # on this path; extract_engine still validates the archive itself.
+        tag = github_latest_tag("bol-van/zapret2")
+        name = "zapret2-%s.tar.gz" % tag
+        url = "https://github.com/bol-van/zapret2/releases/download/%s/%s" % (tag, name)
+        return tag, url, ""
 
 
 def download(url, dest):
@@ -767,8 +919,10 @@ ProtectKernelTunables=yes
 WantedBy=multi-user.target
 """
 
-POLKIT_TEMPLATE = """// Installed by kich-dpi. Allows the session user to start and stop the bypass
-// and the optional WARP tunnel without a password.
+POLKIT_TEMPLATE = """// Installed by kich-dpi. Allows the session user to start, stop and restart
+// the bypass and the optional WARP tunnel without a password.
+// Enabling/disabling units happens once in `setup` as root; toggles only
+// start/stop services, so manage-unit-files is never needed at runtime.
 polkit.addRule(function(action, subject) {{
   if (action.id !== "org.freedesktop.systemd1.manage-units") return;
   if (subject.user !== "{user}") return;
@@ -794,7 +948,7 @@ WorkingDirectory={home}/.local/state/kich-dpi
 # A broken config must fail the start. Without this mihomo comes up with the
 # old file (or not at all) and traffic silently leaves outside the tunnel.
 ExecStartPre=/opt/kich-dpi/mihomo -t -f {home}/.config/kich-dpi/warp.yaml -d {home}/.local/state/kich-dpi
-ExecStart=/opt/kich-dpi/mihomo -f {home}/.config/kich-dpi/warp.yaml -d {home}/.local/state/kich-dpi
+ExecStart=/opt/kich-dpi/app/bin/kich-dpi-warp-run
 Restart=on-failure
 RestartSec=3
 TimeoutStopSec=10
@@ -810,6 +964,28 @@ ProtectKernelTunables=no
 [Install]
 WantedBy=multi-user.target
 """
+
+
+WARP_RUN_TEMPLATE = '''#!/usr/bin/python3
+# Installed by kich-dpi. Starts mihomo only while the WARP toggle is on.
+import json
+import os
+import sys
+
+STATE = {state!r}
+MIHOMO = "/opt/kich-dpi/mihomo"
+CONFIG = {config!r}
+DATA = {data!r}
+
+try:
+    with open(STATE, encoding="utf-8") as fh:
+        wanted = bool(json.load(fh).get("warp", True))
+except (OSError, ValueError):
+    wanted = True
+if not wanted:
+    sys.exit(0)
+os.execv(MIHOMO, [MIHOMO, "-f", CONFIG, "-d", DATA])
+'''
 
 
 def install_app():
@@ -834,6 +1010,13 @@ def install_system(user):
     except KeyError:
         group = user.pw_name
     home = Path(user.pw_dir)
+    # Migrate the old enable/disable choice into the user-owned state file.
+    # From now on the units stay enabled so they can autostart, and each one
+    # reads the state file to decide whether to actually do anything.
+    legacy = {}
+    for unit in (UNIT, WARP_UNIT):
+        state = systemctl("is-enabled", unit=unit).stdout.strip()
+        legacy[unit] = state not in ("disabled", "masked", "masked-runtime")
     write_text(UNIT_PATH, unit_text(
         UNIT_TEMPLATE, user.pw_dir, user=user.pw_name, group=group,
     ))
@@ -845,6 +1028,8 @@ def install_system(user):
     ))
     write_text(SYSCTL_PATH, "net.netfilter.nf_conntrack_tcp_be_liberal=1\n")
     subprocess.run(["systemctl", "daemon-reload"], capture_output=True, text=True)
+    # Both units are enabled once here (as root). Runtime toggles never call
+    # manage-unit-files again, so they need no polkit dialog.
     for unit in (UNIT, WARP_UNIT):
         subprocess.run(["systemctl", "enable", unit], capture_output=True, text=True)
     for folder in (home / ".config" / ENGINE_SLUG, home / ".local" / "state" / ENGINE_SLUG):
@@ -853,6 +1038,23 @@ def install_system(user):
             os.chown(folder, user.pw_uid, user.pw_gid)
         except OSError:
             pass
+    state_path = home / ".config" / ENGINE_SLUG / "state.json"
+    if not state_path.exists():
+        write_json(state_path, {
+            "version": 1,
+            "dpi": legacy[UNIT],
+            "warp": legacy[WARP_UNIT],
+        })
+    try:
+        os.chown(state_path, user.pw_uid, user.pw_gid)
+    except OSError:
+        pass
+    WARP_RUN.parent.mkdir(parents=True, exist_ok=True)
+    write_text(WARP_RUN, WARP_RUN_TEMPLATE.format(
+        state=str(state_path),
+        config=str(home / ".config" / ENGINE_SLUG / "warp.yaml"),
+        data=str(home / ".local" / "state" / ENGINE_SLUG),
+    ), 0o755)
     migrate_account(home, user.pw_uid, user.pw_gid)
     # 0.3.0 kept nfqws2.conf in a RuntimeDirectory; the new unit writes it
     # into state, so drop the stale directory if systemd left it behind.
@@ -915,9 +1117,9 @@ def cmd_setup(archive_arg=""):
     tag = ""
     digest = ""
     if archive:
-        tag = "custom-" + sha256_file(archive)[:8]
         if not archive.exists():
             raise Fail("архив не найден: %s" % archive)
+        tag = "custom-" + sha256_file(archive)[:8]
     else:
         try:
             tag, url, digest = release_info()
@@ -1457,7 +1659,9 @@ def install_rule_lists():
 def ensure_user_lists():
     """Create the user's own direct lists once; never touch them again."""
     for path, header in ((WARP_USER_DOMAINS, WARP_USER_DOMAINS_HEADER),
-                         (WARP_USER_PROCESSES, WARP_USER_PROCESSES_HEADER)):
+                         (WARP_USER_PROCESSES, WARP_USER_PROCESSES_HEADER),
+                         (DPI_DOMAINS_FILE,
+                          DPI_DOMAINS_HEADER + "\n".join(DPI_DOMAINS_DEFAULT) + "\n")):
         if not path.exists():
             write_text(path, header, 0o644)
 
@@ -1479,10 +1683,17 @@ def warp_conflict():
     return ""
 
 
-def warp_status():
-    active, enabled = warp_unit_state()
+def warp_status(_states=None):
+    """Return WARP state. When called from `status_data`, pass the already
+    batched unit states so we don't spawn another systemctl process."""
+    if _states is not None:
+        active, enabled = _states[WARP_UNIT]
+        conflict = ("туннель omarchy-usque активен"
+                    if _states.get("omarchy-usque.service", ("", ""))[0] == "active" else "")
+    else:
+        active, enabled = warp_unit_state()
+        conflict = warp_conflict()
     account = warp_account()
-    conflict = warp_conflict()
     check = read_dict(WARP_CHECK_FILE)
     error = ""
     if not warp_available():
@@ -1528,14 +1739,18 @@ def cmd_warp_on():
     # Always re-render: the template improves between plugin versions and the
     # config is derived state, not user data.
     warp_build(account)
-    cp = warp_systemctl("restart", timeout=30)
+    set_wanted("warp", True)
+    cp = warp_systemctl("restart", timeout=35)
     if cp.returncode != 0:
-        raise Fail((cp.stderr or cp.stdout or "systemctl restart не удался").strip()[-400:])
+        raise Fail((cp.stderr or cp.stdout or "не удалось включить WARP").strip()[-400:])
     out({"ok": True, "warp": warp_status()})
 
 
 def cmd_warp_off():
-    warp_systemctl("stop", timeout=25)
+    set_wanted("warp", False)
+    cp = warp_systemctl("stop", timeout=25)
+    if cp.returncode != 0:
+        raise Fail((cp.stderr or cp.stdout or "не удалось отключить WARP").strip()[-400:])
     out({"ok": True, "warp": warp_status()})
 
 
@@ -1627,9 +1842,15 @@ def progress_data():
     return data
 
 
+CONFLICT_UNIT = "omarchy-zapret2.service"
+USQUE_UNIT = "omarchy-usque.service"
+
+
 def status_data():
     version = installed_version()
-    active, enabled = unit_state()
+    # One systemctl call instead of six — see batched_unit_states().
+    states = batched_unit_states([UNIT, WARP_UNIT, CONFLICT_UNIT, USQUE_UNIT])
+    active, enabled = states[UNIT]
     running = active == "active"
     failed = active == "failed"
     active_doc = read_dict(ACTIVE_FILE)
@@ -1652,7 +1873,7 @@ def status_data():
         })
     rows.sort(key=lambda r: (-r["passed"], r["ms"]))
 
-    other = service_active("omarchy-zapret2.service")
+    other = states[CONFLICT_UNIT][0] == "active"
 
     error = ""
     if not installed():
@@ -1677,7 +1898,7 @@ def status_data():
         "progress": progress,
         "strategies": rows[:8],
         "conflict": other,
-        "warp": warp_status(),
+        "warp": warp_status(_states=states),
         "error": error,
     }
 
@@ -1690,6 +1911,9 @@ def apply_spec(spec, start=True):
         "time": int(time.time()),
     })
     if start:
+        # Applying a strategy is an explicit "on": the service itself reads
+        # this flag at boot; here it only needs manage-units to restart.
+        set_wanted("dpi", True)
         cp = systemctl("restart", timeout=30)
         if cp.returncode != 0:
             raise Fail((cp.stderr or cp.stdout or "systemctl restart не удался").strip()[-400:])
@@ -1707,14 +1931,16 @@ def wait_active(timeout=8.0):
 def cmd_on():
     if not installed():
         raise Fail("сначала установите движок")
-    cp = systemctl("enable", "--now", timeout=35)
+    set_wanted("dpi", True)
+    cp = systemctl("start", timeout=35)
     if cp.returncode != 0:
         raise Fail((cp.stderr or cp.stdout or "не удалось запустить службу").strip()[-400:])
     out(status_data())
 
 
 def cmd_off():
-    cp = systemctl("disable", "--now", timeout=35)
+    set_wanted("dpi", False)
+    cp = systemctl("stop", timeout=25)
     if cp.returncode != 0 and installed():
         raise Fail((cp.stderr or cp.stdout or "не удалось остановить службу").strip()[-400:])
     out(status_data())
@@ -1763,7 +1989,8 @@ def merge_strategies(rows):
         by_id[str(item["id"])] = item
     ordered = sorted(
         by_id.values(),
-        key=lambda r: (-int(r.get("passed") or 0), int(r.get("ms") or 10 ** 9)),
+        key=lambda r: (-int(r.get("health", r.get("passed") or 0)),
+                       int(r.get("ms") or 10 ** 9)),
     )[:8]
     write_json(STRATEGIES_FILE, ordered)
 
@@ -1784,6 +2011,7 @@ def cmd_generate():
         raise Fail("подбор уже идёт")
 
     was_running = is_running()
+    old_wanted = wanted_flags()["dpi"]
     original_doc = read_dict(ACTIVE_FILE)
     original = original_doc.get("spec") if isinstance(original_doc.get("spec"), dict) else None
     fallback = original if original else default_spec()
@@ -1805,10 +2033,14 @@ def cmd_generate():
         write_json(PROGRESS_FILE, progress)
 
     baseline = None
+    baseline_health = (0, -10 ** 9)
     best = None
     rows = []
     try:
         baseline = probe(direct=True)
+        baseline_check = sanity()
+        baseline_health = (priority_health(baseline, baseline_check)
+                           if baseline_check["ok"] else (0, -10 ** 9))
         for index, spec in enumerate(candidates(), 1):
             save_progress(running=True, done=index - 1, current=strategy_name(spec))
 
@@ -1824,10 +2056,14 @@ def cmd_generate():
                                        if not row["ok"])
                     result = dict(result, passed=0, ms=10 ** 9,
                                   error="ломает прямой TLS: " + broken)
+                    health = (0, -10 ** 9)
+                else:
+                    health = priority_health(result, check)
             except Fail as exc:
                 error = str(exc)
                 result = {"passed": 0, "total": len(TARGETS), "ms": 10 ** 9,
                           "results": [], "time": int(time.time()), "error": error}
+                health = (0, -10 ** 9)
 
             # Rejected candidates are saved too, with passed=0: otherwise a
             # strategy measured before the sanity check keeps its old score and
@@ -1839,12 +2075,13 @@ def cmd_generate():
                 "passed": result["passed"],
                 "total": result["total"],
                 "ms": result["ms"],
+                "health": health[0],
                 "time": int(time.time()),
                 "error": str(result.get("error") or "")[:160],
             })
 
-            if best is None or score(result) > score(best[1]):
-                best = (spec, result)
+            if best is None or health > best[2]:
+                best = (spec, result, health)
                 progress["best"] = {
                     "name": strategy_name(spec),
                     "passed": result["passed"],
@@ -1857,16 +2094,22 @@ def cmd_generate():
         keep_original = False
         if best is None:
             keep_original = True
-        elif baseline is not None and score(baseline) >= score(best[1]):
+        elif baseline is not None and baseline_health >= best[2]:
             keep_original = True
         try:
             if keep_original:
-                if original:
+                if not old_wanted:
+                    # The user had the bypass off before measuring: restore
+                    # that state instead of leaving a vetted strategy running.
+                    set_wanted("dpi", False)
+                    systemctl("stop", timeout=20)
+                elif original:
                     if was_running:
                         apply_spec(original, start=True)
                 elif was_running:
                     apply_spec(fallback, start=True)
                 else:
+                    set_wanted("dpi", False)
                     systemctl("stop", timeout=20)
             else:
                 apply_spec(best[0], start=True)
@@ -1984,6 +2227,10 @@ def cmd__run():
     if not installed():
         log("kich-dpi: engine is not installed")
         return 1
+    if not wanted_flags()["dpi"]:
+        log("kich-dpi: выключено (state.json), ничего не запускаю")
+        return 0
+    ensure_user_lists()
     active_doc = read_dict(ACTIVE_FILE)
     spec = active_doc.get("spec") if isinstance(active_doc.get("spec"), dict) else default_spec()
     conf = STATE_DIR / "nfqws2.conf"
@@ -2041,6 +2288,31 @@ def cmd_logs(count):
     out({"ok": True, "lines": lines[-count:]})
 
 
+def service_detail(state):
+    """A stopped unit is not healthy, even if it did not fail to start."""
+    if state.get("failed"):
+        return "не запустилась (failed)"
+    if state.get("running"):
+        return "работает"
+    return "остановлена (%s)" % (state.get("active") or "inactive")
+
+
+def polkit_rule_state():
+    """(ok, detail) for the helper rule, mindful of its private directory.
+
+    /etc/polkit-1/rules.d is 0750 root:polkitd, so an ordinary user cannot
+    stat the rule even when it is installed. Treat an inaccessible directory
+    as unverifiable rather than as a missing rule; a real missing rule is only
+    reportable when the directory can be read.
+    """
+    parent = str(POLKIT_PATH.parent)
+    if not os.access(parent, os.R_OK | os.X_OK):
+        return True, "проверить может только root: %s" % parent
+    if not POLKIT_PATH.exists():
+        return False, str(POLKIT_PATH)
+    return True, str(POLKIT_PATH)
+
+
 def cmd_doctor():
     checks = []
 
@@ -2056,17 +2328,18 @@ def cmd_doctor():
         except (OSError, subprocess.SubprocessError) as exc:
             add("nfqws2", False, exc)
     add("systemd unit", UNIT_PATH.exists(), UNIT_PATH)
-    add("polkit", POLKIT_PATH.exists(), POLKIT_PATH)
+    polkit_ok, polkit_detail = polkit_rule_state()
+    add("polkit", polkit_ok, polkit_detail)
     add("curl", curl_available(), shutil.which("curl") or "")
     add("nft", shutil.which("nft") is not None, shutil.which("nft") or "")
     state = status_data()
-    add("служба", not state["failed"], state["active"])
+    add("служба", state["running"], service_detail(state))
     add("конфликт zapret2", not state["conflict"],
         "omarchy-zapret2 активен" if state["conflict"] else "нет")
     warp = state["warp"]
     add("mihomo", warp["available"], mihomo_version())
     add("аккаунт WARP", warp["registered"], warp["account"])
-    add("служба WARP", not warp["failed"], warp["active"])
+    add("служба WARP", warp["running"], service_detail(warp))
     add("конфликт WARP", not warp["conflict"], warp["conflict"] or "нет")
     if state["active_name"]:
         add("стратегия", True, state["active_name"])

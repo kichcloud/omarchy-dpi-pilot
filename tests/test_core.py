@@ -34,9 +34,9 @@ class CandidatesTest(unittest.TestCase):
         self.assertEqual(self.mod.default_spec()["action"], "fakedsplit")
         self.assertNotEqual(self.mod.default_spec()["action"], "multidisorder")
 
-    def test_twelve_unique_candidates(self):
+    def test_eighteen_unique_candidates(self):
         rows = self.mod.candidates()
-        self.assertEqual(len(rows), 12)
+        self.assertEqual(len(rows), 18)
         names = [row["name"] for row in rows]
         self.assertEqual(len(set(names)), len(names))
         ids = [self.mod.strategy_id(row) for row in rows]
@@ -52,6 +52,27 @@ class CandidatesTest(unittest.TestCase):
                 self.assertIn(row["action"], {"fakedsplit", "fakeddisorder"})
             else:
                 self.assertGreaterEqual(row["repeats"], 1)
+
+    def test_config_limits_desync_to_target_hosts(self):
+        from unittest import mock
+        mod = self.mod
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "dpi-domains.txt"
+            path.write_text("discord.com\nyoutube.com\n", encoding="utf-8")
+            with mock.patch.object(mod, "DPI_DOMAINS_FILE", path):
+                text = mod.render_config(mod.candidates()[0])
+        self.assertEqual(text.count("--hostlist-domains=discord.com,youtube.com"), 3)
+        self.assertIn("--filter-l7=tls\n--hostlist-domains=discord.com,youtube.com", text)
+
+    def test_empty_domain_list_keeps_global_bypass(self):
+        from unittest import mock
+        mod = self.mod
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "dpi-domains.txt"
+            path.write_text("# no selective hosts\n", encoding="utf-8")
+            with mock.patch.object(mod, "DPI_DOMAINS_FILE", path):
+                text = mod.render_config(mod.candidates()[0])
+        self.assertNotIn("--hostlist-domains", text)
 
     def test_config_has_three_profiles(self):
         for row in self.mod.candidates():
@@ -326,6 +347,11 @@ class WarpTest(unittest.TestCase):
         self.assertIn(" -t ", lines[pre[0]])
         self.assertLess(pre[0], start[0])
 
+    def test_warp_unit_starts_through_the_state_aware_wrapper(self):
+        text = self.mod.unit_text(self.mod.WARP_UNIT_TEMPLATE, "/home/u", user="u", group="g")
+        self.assertIn("ExecStart=/opt/kich-dpi/app/bin/kich-dpi-warp-run", text)
+        self.assertNotIn("ExecStart=/opt/kich-dpi/mihomo -f", text)
+
     def test_unit_templates_render_shared_hardening(self):
         shared = (
             "ProtectSystem=strict",
@@ -533,7 +559,9 @@ class ProbeSanityTest(unittest.TestCase):
         from unittest import mock
 
         def fake_probe(url, timeout, interface=""):
-            ok = "ya.ru" in url or "aur.archlinux.org" in url
+            ok = any(host in url for host in
+                     ("ya.ru", "aur.archlinux.org", "gosuslugi.ru",
+                      "proxyapi.ru", "opencode.ai"))
             return ok, (200 if ok else 0), 15, "" if ok else "timeout"
 
         with mock.patch.object(self.mod, "direct_device", return_value="enp8s0"), \
@@ -548,6 +576,61 @@ class ProbeSanityTest(unittest.TestCase):
         strategy may only be kept if AUR still answers directly."""
         urls = [url for _key, url in self.mod.SANITY_TARGETS]
         self.assertIn("https://aur.archlinux.org/", urls)
+
+    def test_sanity_guards_gosuslugi(self):
+        """The usual fake+split variants cut government sites off."""
+        urls = [url for _key, url in self.mod.SANITY_TARGETS]
+        self.assertIn("https://www.gosuslugi.ru/", urls)
+
+    def test_sanity_guards_proxyapi(self):
+        """Losing the provider API must not count as a working strategy."""
+        urls = [url for _key, url in self.mod.SANITY_TARGETS]
+        self.assertIn("https://api.proxyapi.ru/", urls)
+        self.assertIn("https://console.proxyapi.ru/", urls)
+
+    def test_sanity_guards_opencode(self):
+        urls = [url for _key, url in self.mod.SANITY_TARGETS]
+        self.assertIn("https://opencode.ai/inference/openai/v1/models", urls)
+
+
+class PriorityHealthTest(unittest.TestCase):
+    def setUp(self):
+        self.mod = load()
+
+    def test_critical_services_outrank_google(self):
+        def health(discord, youtube, google, api, opencode, ms=100):
+            result = {"ms": ms, "results": [
+                {"key": "discord", "ok": discord},
+                {"key": "youtube", "ok": youtube},
+                {"key": "google", "ok": google},
+            ]}
+            check = {"ok": True, "results": [
+                {"label": "api-proxyapi", "ok": api},
+                {"label": "opencode", "ok": opencode},
+            ]}
+            return self.mod.priority_health(result, check)
+
+        critical = health(True, True, False, True, True)
+        cosmetic = health(False, False, True, False, False)
+        self.assertGreater(critical, cosmetic)
+        self.assertEqual(critical[0], 6 + 6 + 5 + 5)
+        self.assertEqual(cosmetic[0], 1)
+
+    def test_sanity_retries_a_single_failed_probe(self):
+        from unittest import mock
+        calls = []
+
+        def fake_probe(url, timeout, interface=""):
+            calls.append(url)
+            return (True, 200, 10, "") if len(calls) > 1 else (False, 0, 15, "timeout")
+
+        with mock.patch.object(self.mod, "direct_device", return_value=""), \
+             mock.patch.object(self.mod, "http_probe", side_effect=fake_probe), \
+             mock.patch.object(self.mod.time, "sleep"):
+            result = self.mod.sanity()
+        self.assertTrue(result["ok"])
+        # One retry for the single failed target, no retries for the rest.
+        self.assertEqual(len(calls), len(self.mod.SANITY_TARGETS) + 1)
 
 
 class AccountMigrationTest(unittest.TestCase):
@@ -599,6 +682,7 @@ class StateTest(unittest.TestCase):
         self.mod.CONFIG_DIR = base / "config"
         self.mod.STATE_DIR = base / "state"
         self.mod.ACTIVE_FILE = self.mod.CONFIG_DIR / "active.json"
+        self.mod.STATE_FILE = self.mod.CONFIG_DIR / "state.json"
         self.mod.STRATEGIES_FILE = self.mod.CONFIG_DIR / "strategies.json"
         self.mod.CHECK_FILE = self.mod.STATE_DIR / "check.json"
         self.mod.PROGRESS_FILE = self.mod.STATE_DIR / "progress.json"
@@ -647,6 +731,14 @@ class StateTest(unittest.TestCase):
         self.assertEqual(saved[-1]["id"], "a")
         self.assertEqual(saved[-1]["passed"], 0)
 
+    def test_merge_uses_weighted_health_over_plain_passes(self):
+        self.mod.merge_strategies([
+            {"id": "low", "name": "Low", "passed": 3, "ms": 100, "health": 1},
+            {"id": "high", "name": "High", "passed": 2, "ms": 500, "health": 17},
+        ])
+        saved = json.loads(self.mod.STRATEGIES_FILE.read_text())
+        self.assertEqual(saved[0]["id"], "high")
+
     def test_apply_spec_writes_active(self):
         self.mod.systemctl = lambda *a, **k: subprocess.CompletedProcess(
             ["systemctl"], 0, "", "")
@@ -657,28 +749,316 @@ class StateTest(unittest.TestCase):
         self.assertEqual(active["name"], row["name"])
         self.assertEqual(active["id"], self.mod.strategy_id(row))
 
+    def test_wanted_state_is_persistent(self):
+        self.assertTrue(self.mod.wanted_flags()["dpi"])
+        self.mod.set_wanted("dpi", False)
+        self.assertFalse(self.mod.wanted_flags()["dpi"])
+        self.assertTrue(self.mod.wanted_flags()["warp"])
+        self.mod.set_wanted("warp", False)
+        self.assertFalse(self.mod.wanted_flags()["warp"])
+
+    def test_apply_spec_marks_bypass_as_wanted(self):
+        self.mod.systemctl = lambda *a, **k: subprocess.CompletedProcess(
+            ["systemctl"], 0, "", "")
+        self.mod.set_wanted("dpi", False)
+        self.mod.apply_spec(self.mod.candidates()[0], start=True)
+        self.assertTrue(self.mod.wanted_flags()["dpi"])
+
     def test_progress_older_than_half_hour_is_not_running(self):
         self.mod.write_json(self.mod.PROGRESS_FILE, {
-            "running": True, "started": 1, "done": 4, "total": 12,
+            "running": True, "started": 1, "done": 4, "total": 18,
         })
         data = self.mod.progress_data()
         self.assertFalse(data["running"])
         self.assertIn("error", data)
 
 
-class ScoreTest(unittest.TestCase):
+class ReleaseInfoTest(unittest.TestCase):
+    """A 403 from the GitHub API must fall back to the redirect, not block updates."""
+
     def setUp(self):
         self.mod = load()
 
-    def test_more_passes_beat_faster_fewer(self):
-        fast_one = {"passed": 1, "ms": 100}
-        slow_three = {"passed": 3, "ms": 5000}
-        self.assertGreater(self.mod.score(slow_three), self.mod.score(fast_one))
+    def test_api_rate_limit_uses_redirect(self):
+        import urllib.error
+        from unittest import mock
 
-    def test_lower_latency_wins_on_tie(self):
-        slow = {"passed": 2, "ms": 2000}
-        fast = {"passed": 2, "ms": 400}
-        self.assertGreater(self.mod.score(fast), self.mod.score(slow))
+        errors = []
+
+        def fake_urlopen(req, timeout=0):
+            if "api.github.com" in req.full_url:
+                err = urllib.error.HTTPError(
+                    req.full_url, 403, "rate limit exceeded", {}, None)
+                errors.append(err)
+                raise err
+            return _FakeResponse("https://github.com/bol-van/zapret2/releases/tag/v1.0.7")
+
+        class _FakeResponse:
+            def __init__(self, url):
+                self._url = url
+
+            def geturl(self):
+                return self._url
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        with mock.patch.object(self.mod.urllib.request, "urlopen", side_effect=fake_urlopen):
+            tag, url, digest = self.mod.release_info()
+        self.assertEqual(tag, "v1.0.7")
+        self.assertEqual(url, "https://github.com/bol-van/zapret2/releases/download/v1.0.7/zapret2-v1.0.7.tar.gz")
+        self.assertEqual(digest, "")
+        for err in errors:
+            err.close()
+
+    def test_non_403_error_propagates(self):
+        import urllib.error
+        from unittest import mock
+
+        errors = []
+
+        def fake_urlopen(req, timeout=0):
+            err = urllib.error.HTTPError(req.full_url, 500, "server error", {}, None)
+            errors.append(err)
+            raise err
+
+        with mock.patch.object(self.mod.urllib.request, "urlopen", side_effect=fake_urlopen):
+            with self.assertRaises(urllib.error.HTTPError):
+                self.mod.release_info()
+        for err in errors:
+            err.close()
+
+
+class BatchedStatusTest(unittest.TestCase):
+    """A status poll must coalesce systemctl into a single spawn."""
+
+    def setUp(self):
+        self.mod = load()
+
+    def test_parses_multi_unit_show_output(self):
+        from unittest import mock
+        units = [self.mod.UNIT, self.mod.WARP_UNIT, "omarchy-usque.service"]
+        out = ("%s\nactive\nenabled\n\n"
+               "%s\ninactive\nnot-found\n\n"
+               "%s\nactive\n\n" % (units[0], units[1], units[2]))
+        with mock.patch.object(self.mod.subprocess, "run",
+                               return_value=subprocess.CompletedProcess([], 0, out, "")) as run:
+            states = self.mod.batched_unit_states(units)
+        self.assertEqual(states[units[0]], ("active", "enabled"))
+        self.assertEqual(states[units[1]], ("inactive", "not-found"))
+        self.assertEqual(states[units[2]], ("active", "not-found"))  # 2-line block
+        self.assertEqual(run.call_count, 1)
+
+    def test_status_data_uses_single_subprocess(self):
+        from unittest import mock
+        with mock.patch.object(self.mod.subprocess, "run",
+                               return_value=subprocess.CompletedProcess([], 0, "", "")) as run:
+            data = self.mod.status_data()
+        self.assertEqual(run.call_count, 1)
+        self.assertTrue(data["ok"])
+
+
+class WarpEnablementTest(unittest.TestCase):
+    """Toggles persist in a state file and never call manage-unit-files."""
+
+    def setUp(self):
+        self.mod = load()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.mod.STATE_FILE = pathlib.Path(self.tmp.name) / "state.json"
+
+    def test_warp_off_stops_and_remembers(self):
+        from unittest import mock
+        calls = []
+
+        def fake(*args, **kwargs):
+            calls.append(args)
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        with mock.patch.object(self.mod, "warp_systemctl", fake), \
+             mock.patch.object(self.mod, "warp_status", lambda: {}), \
+             mock.patch.object(self.mod, "out", lambda payload: None):
+            self.mod.cmd_warp_off()
+        self.assertEqual(calls, [("stop",)])
+        self.assertFalse(self.mod.wanted_flags()["warp"])
+
+    def test_warp_on_restarts_and_remembers(self):
+        from unittest import mock
+        calls = []
+
+        def fake(*args, **kwargs):
+            calls.append(args)
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        with mock.patch.object(self.mod, "warp_conflict", lambda: ""), \
+             mock.patch.object(self.mod, "warp_available", lambda: True), \
+             mock.patch.object(self.mod, "warp_account", lambda: {"id": "test"}), \
+             mock.patch.object(self.mod, "warp_build", lambda account: None), \
+             mock.patch.object(self.mod, "warp_systemctl", fake), \
+             mock.patch.object(self.mod, "warp_status", lambda: {}), \
+             mock.patch.object(self.mod, "out", lambda payload: None):
+            self.mod.cmd_warp_on()
+        self.assertEqual(calls, [("restart",)])
+        self.assertTrue(self.mod.wanted_flags()["warp"])
+
+
+class DpiToggleTest(unittest.TestCase):
+    def setUp(self):
+        self.mod = load()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.mod.STATE_FILE = pathlib.Path(self.tmp.name) / "state.json"
+
+    def test_on_uses_start_and_off_uses_stop(self):
+        from unittest import mock
+        calls = []
+
+        def fake(*args, **kwargs):
+            calls.append(args)
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        with mock.patch.object(self.mod, "installed", lambda: True), \
+             mock.patch.object(self.mod, "systemctl", fake), \
+             mock.patch.object(self.mod, "status_data", lambda: {}), \
+             mock.patch.object(self.mod, "out", lambda payload: None):
+            self.mod.cmd_on()
+            self.assertTrue(self.mod.wanted_flags()["dpi"])
+            self.mod.cmd_off()
+            self.assertFalse(self.mod.wanted_flags()["dpi"])
+        self.assertEqual(calls, [("start",), ("stop",)])
+
+
+class DoctorPolkitTest(unittest.TestCase):
+    def setUp(self):
+        self.mod = load()
+
+    def test_private_directory_is_not_reported_as_missing_rule(self):
+        from unittest import mock
+        with mock.patch.object(self.mod.os, "access", lambda path, mode: False), \
+             mock.patch.object(self.mod, "POLKIT_PATH",
+                               pathlib.Path("/no/such/49-kich-dpi.rules")):
+            ok, detail = self.mod.polkit_rule_state()
+        self.assertTrue(ok)
+        self.assertIn("root", detail)
+
+    def test_missing_rule_is_reported_when_directory_is_readable(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as tmp:
+            rule = pathlib.Path(tmp) / "49-kich-dpi.rules"
+            with mock.patch.object(self.mod.os, "access", lambda path, mode: True), \
+                 mock.patch.object(self.mod, "POLKIT_PATH", rule):
+                ok, detail = self.mod.polkit_rule_state()
+            self.assertFalse(ok)
+            self.assertEqual(detail, str(rule))
+
+            rule.write_text("// installed\n", encoding="utf-8")
+            with mock.patch.object(self.mod.os, "access", lambda path, mode: True), \
+                 mock.patch.object(self.mod, "POLKIT_PATH", rule):
+                ok, detail = self.mod.polkit_rule_state()
+            self.assertTrue(ok)
+            self.assertEqual(detail, str(rule))
+
+
+class PolkitRuleTest(unittest.TestCase):
+    def setUp(self):
+        self.mod = load()
+
+    def test_rule_allows_enable_and_disable(self):
+        text = self.mod.POLKIT_TEMPLATE.format(
+            user="u", unit=self.mod.UNIT, warp_unit=self.mod.WARP_UNIT)
+        self.assertIn("org.freedesktop.systemd1.manage-units", text)
+        self.assertNotIn('action.id === "org.freedesktop.systemd1.manage-unit-files"', text)
+        self.assertEqual(text.count("action.id"), 1)
+        self.assertIn('unit === "%s"' % self.mod.UNIT, text)
+        self.assertIn('unit === "%s"' % self.mod.WARP_UNIT, text)
+
+
+class SetupEnablementTest(unittest.TestCase):
+    """Units stay enabled; the user's choice lives in state.json."""
+
+    def setUp(self):
+        self.mod = load()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def _install(self, enabled):
+        from unittest import mock
+        calls = []
+
+        def fake_run(argv, **kwargs):
+            calls.append(list(argv))
+            if argv[:2] == ["systemctl", "is-enabled"]:
+                out = "enabled\n" if enabled.get(argv[2], True) else "disabled\n"
+                return subprocess.CompletedProcess(argv, 0, out, "")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        user = SimpleNamespace(pw_name="u", pw_dir=self.tmp.name,
+                               pw_uid=1000, pw_gid=1000)
+        with mock.patch.object(self.mod.grp, "getgrgid",
+                               lambda gid: SimpleNamespace(gr_name="users")), \
+             mock.patch.object(self.mod, "write_text", lambda *a, **k: None), \
+             mock.patch.object(self.mod, "WARP_RUN",
+                               pathlib.Path(self.tmp.name) / "warp-run"), \
+             mock.patch.object(self.mod.subprocess, "run", fake_run), \
+             mock.patch.object(self.mod.shutil, "rmtree", lambda *a, **k: None), \
+             mock.patch.object(self.mod, "migrate_account", lambda *a, **k: None):
+            self.mod.install_system(user)
+        return calls
+
+    def test_setup_always_enables_both_units(self):
+        calls = self._install({self.mod.UNIT: False, self.mod.WARP_UNIT: False})
+        self.assertIn(["systemctl", "enable", self.mod.UNIT], calls)
+        self.assertIn(["systemctl", "enable", self.mod.WARP_UNIT], calls)
+
+    def test_setup_migrates_old_choice_into_state(self):
+        self._install({self.mod.UNIT: False, self.mod.WARP_UNIT: True})
+        state = json.loads((pathlib.Path(self.tmp.name) / ".config" / "kich-dpi"
+                            / "state.json").read_text())
+        self.assertFalse(state["dpi"])
+        self.assertTrue(state["warp"])
+
+
+class DoctorServiceTest(unittest.TestCase):
+    def setUp(self):
+        self.mod = load()
+
+    def _doctor(self, running, failed, active):
+        from unittest import mock
+        warp = {"available": True, "registered": True, "account": "x",
+                "running": running, "failed": failed, "active": active,
+                "conflict": ""}
+        state = {"failed": failed, "active": active, "running": running,
+                 "active_name": "strategy", "conflict": False, "warp": warp}
+        captured = {}
+
+        def fake_run(argv, **kwargs):
+            return subprocess.CompletedProcess(argv, 0, "v1.0.7\n", "")
+
+        with mock.patch.object(self.mod, "status_data", lambda: state), \
+             mock.patch.object(self.mod.subprocess, "run", fake_run), \
+             mock.patch.object(self.mod, "out", captured.update):
+            self.mod.cmd_doctor()
+        return {row["name"]: row for row in captured["checks"]}
+
+    def test_stopped_services_are_not_healthy(self):
+        checks = self._doctor(False, False, "inactive")
+        self.assertFalse(checks["служба"]["ok"])
+        self.assertIn("остановлена", checks["служба"]["detail"])
+        self.assertFalse(checks["служба WARP"]["ok"])
+        self.assertEqual(checks["служба WARP"]["detail"], "остановлена (inactive)")
+
+    def test_failed_service_is_named_as_failed(self):
+        checks = self._doctor(False, True, "failed")
+        self.assertFalse(checks["служба"]["ok"])
+        self.assertIn("failed", checks["служба"]["detail"])
+
+    def test_running_services_are_healthy(self):
+        checks = self._doctor(True, False, "active")
+        self.assertTrue(checks["служба"]["ok"])
+        self.assertTrue(checks["служба WARP"]["ok"])
 
 
 if __name__ == "__main__":
