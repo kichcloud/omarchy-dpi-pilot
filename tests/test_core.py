@@ -29,6 +29,11 @@ class CandidatesTest(unittest.TestCase):
     def setUp(self):
         self.mod = load()
 
+    def test_default_strategy_avoids_disorder(self):
+        # The shipped fallback must not be a strategy that breaks direct TLS.
+        self.assertEqual(self.mod.default_spec()["action"], "fakedsplit")
+        self.assertNotEqual(self.mod.default_spec()["action"], "multidisorder")
+
     def test_twelve_unique_candidates(self):
         rows = self.mod.candidates()
         self.assertEqual(len(rows), 12)
@@ -173,7 +178,7 @@ class WarpTest(unittest.TestCase):
         self.assertEqual(proxy["name"], "WARP")
         self.assertEqual(proxy["type"], "masque")
         self.assertEqual(proxy["port"], 443)
-        self.assertEqual(proxy["network"], "h2")
+        self.assertEqual(proxy["network"], "quic")
         self.assertEqual(proxy["server"], self.mod.WARP_ENDPOINT)
         # YouTube's IPv4 egress is throttled here; its IPv6 path is clean.
         self.assertEqual(proxy["ip-version"], "ipv6-prefer")
@@ -478,6 +483,48 @@ class WarpConfigRefreshTest(unittest.TestCase):
         self.assertIn("нет списков правил", note) 
 
 
+class ProbeSanityTest(unittest.TestCase):
+    """Strategy generation must measure the DPI path, not the WARP tunnel."""
+
+    def setUp(self):
+        self.mod = load()
+
+    def test_default_device_parses_the_main_route(self):
+        self.assertEqual(self.mod.default_device(
+            "default via 192.168.0.1 dev enp8s0 proto dhcp src 192.168.0.113"),
+            "enp8s0")
+        self.assertEqual(self.mod.default_device(""), "")
+
+    def test_direct_probe_binds_the_physical_interface(self):
+        from unittest import mock
+        seen = []
+
+        def fake_probe(url, timeout, interface=""):
+            seen.append(interface)
+            return True, 204, 10, ""
+
+        with mock.patch.object(self.mod, "direct_device", return_value="enp8s0"), \
+             mock.patch.object(self.mod, "http_probe", side_effect=fake_probe), \
+             mock.patch.object(self.mod.time, "sleep"):
+            result = self.mod.probe(direct=True)
+        self.assertTrue(result["direct"])
+        self.assertEqual(set(seen), {"enp8s0"})
+
+    def test_sanity_fails_when_a_control_host_does_not_answer(self):
+        from unittest import mock
+
+        def fake_probe(url, timeout, interface=""):
+            ok = "ya.ru" in url
+            return ok, (200 if ok else 0), 15, "" if ok else "timeout"
+
+        with mock.patch.object(self.mod, "direct_device", return_value="enp8s0"), \
+             mock.patch.object(self.mod, "http_probe", side_effect=fake_probe):
+            result = self.mod.sanity()
+        self.assertFalse(result["ok"])
+        self.assertEqual([row["label"] for row in result["results"] if not row["ok"]],
+                         ["example"])
+
+
 class AccountMigrationTest(unittest.TestCase):
     def setUp(self):
         self.mod = load()
@@ -566,6 +613,14 @@ class StateTest(unittest.TestCase):
         self.assertEqual(saved[0]["id"], "a")
         self.assertEqual(saved[0]["name"], "A2")
         self.assertEqual(len(saved), 3)
+
+        # A candidate that fails the new sanity check must lose its old score.
+        self.mod.merge_strategies([
+            {"id": "a", "name": "A2", "passed": 0, "total": 3, "ms": 10 ** 9},
+        ])
+        saved = json.loads(self.mod.STRATEGIES_FILE.read_text())
+        self.assertEqual(saved[-1]["id"], "a")
+        self.assertEqual(saved[-1]["passed"], 0)
 
     def test_apply_spec_writes_active(self):
         self.mod.systemctl = lambda *a, **k: subprocess.CompletedProcess(

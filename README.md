@@ -45,7 +45,7 @@ omarchy plugin add https://github.com/kichcloud/omarchy-dpi-pilot.git --enable -
 | `/etc/sysctl.d/90-kich-dpi.conf` | `nf_conntrack_tcp_be_liberal=1` |
 | `~/.config/kich-dpi/active.json` | выбранная стратегия |
 | `~/.config/kich-dpi/strategies.json` | сохранённые варианты |
-| `~/.config/kich-dpi/warp.yaml` | сгенерированный конфиг mihomo |
+| `~/.config/kich-dpi/warp.yaml` | сгенерированный конфиг mihomo (MASQUE поверх QUIC) |
 | `~/.local/state/kich-dpi/rules/` | списки российских доменов и IP, копия из `/opt/kich-dpi/app/data` |
 | `~/.config/kich-dpi/direct-domains.txt` | ваши домены мимо туннеля (не перезаписывается) |
 | `~/.config/kich-dpi/direct-processes.txt` | ваши программы мимо туннеля (не перезаписывается) |
@@ -60,6 +60,9 @@ omarchy plugin add https://github.com/kichcloud/omarchy-dpi-pilot.git --enable -
 ## Как работает подбор
 
 `bin/kich-dpi generate` строит 12 конфигураций из комбинаций:
+
+Подбор всегда идёт по физическому интерфейсу в обход WARP: иначе проверка видит только туннель и выбирает стратегию, которая ломает прямой TLS. Каждая конфигурация дополнительно проверяется на `ya.ru` и `example.com`; если прямой TLS к ним не работает, вариант отбрасывается.
+
 
 - fake + multisplit / multidisorder;
 - fakedsplit / fakeddisorder;

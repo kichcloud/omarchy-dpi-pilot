@@ -34,7 +34,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-VERSION = "0.4.0"
+VERSION = "0.4.2"
 
 UNIT = "kich-dpi.service"
 TABLE = "kich_dpi"
@@ -319,7 +319,15 @@ def candidates():
 
 
 def default_spec():
-    return candidates()[0]
+    """Split-only default: no fake packets and no reordering of real data.
+
+    multidisorder, the old default, made servers acknowledge only the first
+    byte of a split ClientHello on this ISP: every direct TLS connection hung.
+    """
+    for spec in candidates():
+        if spec["name"] == "fakedsplit at 1":
+            return spec
+    return candidates()[-1]
 
 
 def render_config(spec, dry_run=False):
@@ -394,38 +402,78 @@ def curl_available():
     return shutil.which("curl") is not None
 
 
-def probe(targets=TARGETS, timeout=7):
+# Hosts that no Russian ISP blocks. A desync that breaks TLS here would break
+# every direct site too, which is never an acceptable price for a working
+# YouTube: 0.4.0 picked exactly such a strategy because its measurement went
+# through the WARP tunnel and never touched the DPI path.
+SANITY_TARGETS = (
+    ("ya", "https://ya.ru/"),
+    ("example", "https://example.com/"),
+)
+
+
+def default_device(text):
+    parts = str(text or "").split()
+    if "dev" in parts:
+        index = parts.index("dev") + 1
+        if index < len(parts):
+            return parts[index]
+    return ""
+
+
+def direct_device():
+    """Physical interface from the main table, not the WARP policy table."""
+    try:
+        cp = subprocess.run(
+            ["ip", "-4", "route", "show", "default", "table", "main"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return default_device(cp.stdout)
+
+
+def http_probe(url, timeout, interface=""):
+    """One request; returns (ok, code, ms, error)."""
+    started = time.monotonic()
+    args = [
+        "curl", "-sS", "-o", "/dev/null",
+        "--connect-timeout", "4", "--max-time", str(timeout),
+        "-A", "Mozilla/5.0 (X11; Linux x86_64)",
+        "-w", "%{http_code} %{time_total}",
+    ]
+    if interface:
+        # Binding the source address also bypasses the WARP policy rule, so the
+        # probe reaches the physical link where nfqws2 actually works.
+        args += ["--interface", interface, "-4"]
+    args.append(url)
+    try:
+        cp = subprocess.run(args, capture_output=True, text=True, timeout=timeout + 3)
+        parts = (cp.stdout or "").strip().split()
+        code = int(parts[0]) if parts and parts[0].isdigit() else 0
+        elapsed = float(parts[1]) if len(parts) > 1 else (time.monotonic() - started)
+        ok = cp.returncode == 0 and 200 <= code < 400
+        error = "" if ok else (cp.stderr or "").strip()
+        error = error.splitlines()[-1] if error else ""
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        code, elapsed, ok, error = 0, time.monotonic() - started, False, str(exc)
+    return ok, code, int(round(elapsed * 1000)), error[:160]
+
+
+def probe(targets=TARGETS, timeout=7, direct=False):
     if not curl_available():
         raise Fail("не найден curl")
+    device = direct_device() if direct else ""
     results = []
     for key, label, url in targets:
-        started = time.monotonic()
-        try:
-            cp = subprocess.run(
-                [
-                    "curl", "-sS", "-o", "/dev/null",
-                    "--connect-timeout", "4", "--max-time", str(timeout),
-                    "-A", "Mozilla/5.0 (X11; Linux x86_64)",
-                    "-w", "%{http_code} %{time_total}",
-                    url,
-                ],
-                capture_output=True, text=True, timeout=timeout + 3,
-            )
-            parts = (cp.stdout or "").strip().split()
-            code = int(parts[0]) if parts and parts[0].isdigit() else 0
-            elapsed = float(parts[1]) if len(parts) > 1 else (time.monotonic() - started)
-            ok = cp.returncode == 0 and 200 <= code < 400
-            error = "" if ok else (cp.stderr or "").strip()
-            error = error.splitlines()[-1] if error else ""
-        except (OSError, subprocess.SubprocessError, ValueError) as exc:
-            code, elapsed, ok, error = 0, time.monotonic() - started, False, str(exc)
+        ok, code, ms, error = http_probe(url, timeout, device)
         results.append({
             "key": key,
             "label": label,
             "ok": ok,
             "code": code,
-            "ms": int(round(elapsed * 1000)),
-            "error": error[:160],
+            "ms": ms,
+            "error": error,
         })
         time.sleep(0.15)
     passed = sum(1 for row in results if row["ok"])
@@ -436,7 +484,20 @@ def probe(targets=TARGETS, timeout=7):
         "total": len(results),
         "ms": latency,
         "results": results,
+        "direct": bool(device),
     }
+
+
+def sanity(timeout=6):
+    """Reject a strategy that breaks TLS to hosts which are not blocked."""
+    device = direct_device()
+    results = []
+    for key, url in SANITY_TARGETS:
+        ok, code, ms, error = http_probe(url, timeout, device)
+        results.append({"key": key, "label": key, "ok": ok, "code": code,
+                        "ms": ms, "error": error})
+    return {"ok": all(row["ok"] for row in results), "device": device,
+            "results": results}
 
 
 def score(result):
@@ -1288,7 +1349,10 @@ def warp_config_text(account):
     # dead page, so it rides the tunnel as well.
     add("    udp: true")
     add("    sni: %s" % yaml_str(WARP_SNI))
-    add("    network: h2")
+    # MASQUE over QUIC. The h2 transport periodically lost new TCP connects
+    # (6 s timeouts every few probes) and capped 1 MB ranges at ~0.3 MB/s;
+    # QUIC had 0 failures in 300 s and doubled the throughput.
+    add("    network: quic")
     # Google throttles its IPv4 ranges in Russia, and WARP's own egress lives
     # there too, so YouTube inside the tunnel used to lose about half of its
     # TLS handshakes. The IPv6 path through WARP is clean: preferring it took
@@ -1709,7 +1773,7 @@ def cmd_generate():
     best = None
     rows = []
     try:
-        baseline = probe()
+        baseline = probe(direct=True)
         for index, spec in enumerate(candidates(), 1):
             save_progress(running=True, done=index - 1, current=strategy_name(spec))
 
@@ -1718,22 +1782,31 @@ def cmd_generate():
                 apply_spec(spec, start=True)
                 if not wait_active():
                     raise Fail("служба не запустилась")
-                result = probe()
+                result = probe(direct=True)
+                check = sanity()
+                if result["passed"] > 0 and not check["ok"]:
+                    broken = ", ".join(row["label"] for row in check["results"]
+                                       if not row["ok"])
+                    result = dict(result, passed=0, ms=10 ** 9,
+                                  error="ломает прямой TLS: " + broken)
             except Fail as exc:
                 error = str(exc)
                 result = {"passed": 0, "total": len(TARGETS), "ms": 10 ** 9,
                           "results": [], "time": int(time.time()), "error": error}
 
-            if result["passed"] > 0:
-                rows.append({
-                    "id": strategy_id(spec),
-                    "name": strategy_name(spec),
-                    "spec": spec,
-                    "passed": result["passed"],
-                    "total": result["total"],
-                    "ms": result["ms"],
-                    "time": int(time.time()),
-                })
+            # Rejected candidates are saved too, with passed=0: otherwise a
+            # strategy measured before the sanity check keeps its old score and
+            # stays in the list even though it now breaks direct TLS.
+            rows.append({
+                "id": strategy_id(spec),
+                "name": strategy_name(spec),
+                "spec": spec,
+                "passed": result["passed"],
+                "total": result["total"],
+                "ms": result["ms"],
+                "time": int(time.time()),
+                "error": str(result.get("error") or "")[:160],
+            })
 
             if best is None or score(result) > score(best[1]):
                 best = (spec, result)
