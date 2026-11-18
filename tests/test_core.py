@@ -533,7 +533,7 @@ class ProbeSanityTest(unittest.TestCase):
         from unittest import mock
 
         def fake_probe(url, timeout, interface=""):
-            ok = "ya.ru" in url
+            ok = "ya.ru" in url or "aur.archlinux.org" in url
             return ok, (200 if ok else 0), 15, "" if ok else "timeout"
 
         with mock.patch.object(self.mod, "direct_device", return_value="enp8s0"), \
@@ -542,6 +542,12 @@ class ProbeSanityTest(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertEqual([row["label"] for row in result["results"] if not row["ok"]],
                          ["example"])
+
+    def test_sanity_guards_the_aur(self):
+        """AUR aborts with `unrecognized name` on tcp_md5 fooling, so a
+        strategy may only be kept if AUR still answers directly."""
+        urls = [url for _key, url in self.mod.SANITY_TARGETS]
+        self.assertIn("https://aur.archlinux.org/", urls)
 
 
 class AccountMigrationTest(unittest.TestCase):
