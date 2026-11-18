@@ -50,25 +50,18 @@ omarchy plugin add https://github.com/kichcloud/omarchy-dpi-pilot.git --enable -
 | `/etc/systemd/system/kich-dpi-warp.service` | служба WARP (mihomo) |
 | `/etc/polkit-1/rules.d/49-kich-dpi.rules` | start/stop/restart двух юнитов без пароля; `manage-unit-files` не нужен |
 | `/etc/sysctl.d/90-kich-dpi.conf` | `nf_conntrack_tcp_be_liberal=1` |
-| `~/.config/kich-dpi/state.json` | сохраняемое состояние тумблеров DPI и WARP |
-| `~/.config/kich-dpi/active.json` | выбранная стратегия |
-| `~/.config/kich-dpi/strategies.json` | сохранённые варианты |
-| `~/.config/kich-dpi/warp.yaml` | сгенерированный конфиг mihomo (MASQUE поверх QUIC) |
-| `~/.local/state/kich-dpi/rules/` | списки российских доменов и IP, копия из `/opt/kich-dpi/app/data` |
-| `~/.config/kich-dpi/direct-domains.txt` | ваши домены мимо туннеля (не перезаписывается) |
-| `~/.config/kich-dpi/direct-processes.txt` | ваши программы мимо туннеля (не перезаписывается) |
-| `~/.config/kich-dpi/dpi-domains.txt` | домены, к которым применяется DPI-обход (пустой файл = глобальный обход) |
-| `~/.local/state/kich-dpi/account.json` | ключи WARP-устройства (0600) |
-| `~/.local/state/kich-dpi/nfqws2.conf` | рабочий конфиг nfqws2, создаётся при старте службы |
-| `~/.local/state/kich-dpi/` | результаты проверок и прогресс подбора |
+| `~/.local/state/kich-dpi/` | **единственный** каталог конфига и состояния: `state.json`, `active.json`, `strategies.json`, `warp.yaml`, списки доменов, `rules/`, `account.json` (0600), `nfqws2.conf`, результаты проверок и прогресс подбора |
+| `~/.config/kich-dpi` | симлинк на каталог выше — старые пути и `ConditionPathExists` в юните продолжают работать, `/etc` не меняется |
 
-С 0.4.0 всё изменяемое состояние лежит в `~/.local/state/kich-dpi`; каталоги `~/.local/share/kich-dpi` и `/run/kich-dpi` больше не создаются, а аккаунт WARP из старой раскладки переносится автоматически.
+С 0.4.0 всё изменяемое состояние лежит в `~/.local/state/kich-dpi`; каталоги `~/.local/share/kich-dpi` и `/run/kich-dpi` больше не создаются, а аккаунт WARP из старой раскладки переносится автоматически. Начиная с этой версии туда же переезжают и файлы конфига: `setup` один раз переносит их из `~/.config/kich-dpi` и оставляет вместо старого каталога симлинк.
+
+Сам плагин — плоская папка без подкаталогов: `DpiPilot.qml`, `DpiSection.qml`, `DpiIcon.qml`, `Model.js`, `kich-dpi`, `ru-domain.txt`, `ru-ip.txt`, `test_core.py`, `manifest.json`, `README.md`, `LICENSE`, `.gitignore`.
 
 Свои nftables-таблица `inet kich_dpi`, очередь `230` и метка `0x10000000` не пересекаются с `omarchy-zapret2`. Но два DPI-обходчика одновременно перехватывать один и тот же трафик не должны: попап предупредит, если `omarchy-zapret2.service` активен.
 
 ## Как работает подбор
 
-`bin/kich-dpi generate` строит 18 конфигураций из комбинаций:
+`./kich-dpi generate` строит 18 конфигураций из комбинаций:
 
 Подбор всегда идёт по физическому интерфейсу в обход WARP: иначе проверка видит только туннель и выбирает стратегию, которая ломает прямой TLS. Каждая конфигурация дополнительно проверяется на `ya.ru`, `example.com`, `aur.archlinux.org`, `www.gosuslugi.ru`, `api.proxyapi.ru` и `console.proxyapi.ru`; если прямой TLS к ним не работает, вариант отбрасывается.
 
@@ -146,23 +139,23 @@ YouTube в России режется по IPv4, а WARP выходит из М
 
 ## Команды
 
-`bin/kich-dpi` — обычный исполняемый файл, все ответы в JSON:
+`./kich-dpi` — обычный исполняемый файл, все ответы в JSON:
 
 ```bash
-bin/kich-dpi status            # состояние для панели
-bin/kich-dpi on | off | toggle # включить/выключить
-bin/kich-dpi check             # проверить три сайта
-bin/kich-dpi generate          # сгенерировать и измерить стратегии
-bin/kich-dpi strategies        # сохранённые варианты
-bin/kich-dpi use <id>          # применить сохранённую
-bin/kich-dpi doctor            # диагностика
-bin/kich-dpi logs 100          # журнал службы
-pkexec bin/kich-dpi setup      # поставить/обновить движок и mihomo
-pkexec bin/kich-dpi remove [--purge]
+./kich-dpi status            # состояние для панели
+./kich-dpi on | off | toggle # включить/выключить
+./kich-dpi check             # проверить три сайта
+./kich-dpi generate          # сгенерировать и измерить стратегии
+./kich-dpi strategies        # сохранённые варианты
+./kich-dpi use <id>          # применить сохранённую
+./kich-dpi doctor            # диагностика
+./kich-dpi logs 100          # журнал службы
+pkexec ./kich-dpi setup      # поставить/обновить движок и mihomo
+pkexec ./kich-dpi remove [--purge]
 
-bin/kich-dpi warp-on | warp-off | warp-toggle
-bin/kich-dpi warp-register     # перерегистрировать аккаунт Cloudflare
-bin/kich-dpi warp-check        # идёт ли трафик через WARP
+./kich-dpi warp-on | warp-off | warp-toggle
+./kich-dpi warp-register     # перерегистрировать аккаунт Cloudflare
+./kich-dpi warp-check        # идёт ли трафик через WARP
 ```
 
 IPC из шелла:
@@ -181,10 +174,10 @@ omarchy-shell kich.dpi-pilot generate
 
 - `journalctl -u kich-dpi -f` — журнал `nfqws2` и менеджера.
 - `journalctl -u kich-dpi-warp -f` — журнал mihomo.
-- `bin/kich-dpi doctor` — движок, mihomo, аккаунт WARP, юниты, polkit, curl, nft, конфликты с `omarchy-zapret2` и `omarchy-usque`.
+- `./kich-dpi doctor` — движок, mihomo, аккаунт WARP, юниты, polkit, curl, nft, конфликты с `omarchy-zapret2` и `omarchy-usque`.
 - Если служба падает сразу после старта, проверьте, что ядро поддерживает `nf_tables`/`NFQUEUE`, есть `/dev/net/tun` и что другой обход не держит очередь `230`.
-- WARP не поднялся: `bin/kich-dpi warp-check` покажет `warp=on/off` и флаг `tun` (идёт ли обычный трафик через `kichwarp`), а `warp-register` пересоздаст аккаунт, если Cloudflare его отклонил. `journalctl -u kich-dpi-warp` после `ExecStartPre` начинается с ошибки `mihomo -t`, если конфиг или список правил сломан.
-- Свои списки: `bin/kich-dpi warp-on` пересобирает конфиг и переустанавливает `rules/` из `/opt/kich-dpi/app/data/rules`. Если списков там нет (старая системная часть), команда прямо скажет обновиться.
+- WARP не поднялся: `./kich-dpi warp-check` покажет `warp=on/off` и флаг `tun` (идёт ли обычный трафик через `kichwarp`), а `warp-register` пересоздаст аккаунт, если Cloudflare его отклонил. `journalctl -u kich-dpi-warp` после `ExecStartPre` начинается с ошибки `mihomo -t`, если конфиг или список правил сломан.
+- Свои списки: `./kich-dpi warp-on` пересобирает конфиг и переустанавливает `rules/` из `/opt/kich-dpi/app/data/rules`. Если списков там нет (старая системная часть), команда прямо скажет обновиться.
 - После смены сети подбор стоит повторить: у разных провайдеров работают разные комбинации.
 - `setup` проверяет новую версию движка через GitHub API. Он без авторизации даёт только 60 запросов в час, поэтому при исчерпании лимита (HTTP 403) менеджер теперь определяет тег через `/releases/latest` без API и продолжает обновление — тревожное сообщение «сеть недоступна» при уже актуальном движке больше не появляется. Архив всё равно проверяется распаковкой.
 - Пока попап открыт, он опрашивает `status` каждые 2.5 с (0.9 с во время подбора, 8 с когда закрыт). Один опрос — это один процесс Python + **один** `systemctl show` на все четыре юнитов сразу. Раньше на каждый опрос уходило шесть отдельных `systemctl` (is-active/is-enabled для DPI, WARP и двух конфликтующих туннелей), и именно они, а не тумблеры, создавали больше всего процессов. Тесты отдельно проверяют, что `status_data()` делает ровно один `systemctl`-вызов.

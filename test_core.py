@@ -13,8 +13,8 @@ import tempfile
 import unittest
 from types import SimpleNamespace
 
-ROOT = pathlib.Path(__file__).resolve().parent.parent
-BIN = ROOT / "bin" / "kich-dpi"
+ROOT = pathlib.Path(__file__).resolve().parent
+BIN = ROOT / "kich-dpi"
 
 
 def load():
@@ -179,7 +179,7 @@ class WarpTest(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         base = pathlib.Path(self.tmp.name)
         # The real paths point into /opt and $HOME; keep every test in a sandbox.
-        self.mod.BUNDLED_RULES = ROOT / "data" / "rules"
+        self.mod.BUNDLED_RULES = ROOT
         self.mod.WARP_RULES = base / "rules"
         self.mod.WARP_USER_DOMAINS = base / "direct-domains.txt"
         self.mod.WARP_USER_PROCESSES = base / "direct-processes.txt"
@@ -261,8 +261,8 @@ class WarpTest(unittest.TestCase):
             self.mod.warp_config_text(self.ACCOUNT)
 
     def test_rule_lists_ship_with_the_plugin(self):
-        domains = self.mod.list_lines(ROOT / "data" / "rules" / "ru-domain.txt")
-        ips = self.mod.list_lines(ROOT / "data" / "rules" / "ru-ip.txt")
+        domains = self.mod.list_lines(ROOT / "ru-domain.txt")
+        ips = self.mod.list_lines(ROOT / "ru-ip.txt")
         self.assertIn("gosuslugi.ru", domains)
         self.assertGreater(len(domains), 40)
         self.assertNotIn("#", domains[0])

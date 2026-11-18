@@ -26,7 +26,7 @@ Item {
   width: parent ? parent.width : 0
 
   readonly property string bin: {
-    var path = String(Qt.resolvedUrl("bin/kich-dpi") || "")
+    var path = String(Qt.resolvedUrl("kich-dpi") || "")
     if (path.indexOf("file://") === 0) path = path.substring(7)
     return decodeURIComponent(path)
   }

@@ -1005,13 +1005,43 @@ def install_app():
     if src != dest:
         shutil.copy2(src, dest)
     os.chmod(dest, 0o755)
-    # Bundled rule lists travel with the app: they stay root-owned and read-only
-    # for the user, and `warp-on` copies them into mihomo's data directory.
-    data_src = src.parent.parent / "data"
-    data_dest = APP_DIR / "data"
-    if data_src.is_dir() and data_src.resolve() != data_dest.resolve():
-        shutil.rmtree(data_dest, ignore_errors=True)
-        shutil.copytree(data_src, data_dest)
+    # Bundled rule lists sit next to the CLI in the flat plugin folder. Copy
+    # them into the same /opt/.../data/rules layout BUNDLED_RULES and the units
+    # already expect, so nothing outside the repo has to change.
+    data_dest = APP_DIR / "data" / "rules"
+    shutil.rmtree(data_dest, ignore_errors=True)
+    data_dest.mkdir(parents=True, exist_ok=True)
+    for name in ("ru-domain.txt", "ru-ip.txt"):
+        rule = src.parent / name
+        if rule.is_file():
+            shutil.copy2(rule, data_dest / name)
+
+
+def merge_config_into_state(home, uid, gid):
+    """One-time layout merge: ~/.config/kich-dpi -> ~/.local/state/kich-dpi.
+
+    The state directory stays the real folder (mihomo's `-d` and the units use
+    it); the old config path becomes a symlink, so every existing path —
+    including the WARP unit's ConditionPathExists in /etc — keeps working
+    without touching a single system file.
+    """
+    legacy = Path(home) / ".config" / ENGINE_SLUG
+    state = Path(home) / ".local" / "state" / ENGINE_SLUG
+    state.mkdir(parents=True, exist_ok=True)
+    if legacy.is_symlink():
+        return state
+    if legacy.is_dir():
+        for entry in legacy.iterdir():
+            target = state / entry.name
+            if not target.exists():
+                shutil.move(str(entry), str(target))
+        legacy.rmdir()
+        legacy.symlink_to(state, target_is_directory=True)
+    try:
+        os.chown(state, uid, gid)
+    except OSError:
+        pass
+    return state
 
 
 def install_system(user):
@@ -1042,12 +1072,7 @@ def install_system(user):
     # manage-unit-files again, so they need no polkit dialog.
     for unit in (UNIT, WARP_UNIT):
         subprocess.run(["systemctl", "enable", unit], capture_output=True, text=True)
-    for folder in (home / ".config" / ENGINE_SLUG, home / ".local" / "state" / ENGINE_SLUG):
-        folder.mkdir(parents=True, exist_ok=True)
-        try:
-            os.chown(folder, user.pw_uid, user.pw_gid)
-        except OSError:
-            pass
+    merge_config_into_state(home, user.pw_uid, user.pw_gid)
     state_path = home / ".config" / ENGINE_SLUG / "state.json"
     if not state_path.exists():
         write_json(state_path, {
