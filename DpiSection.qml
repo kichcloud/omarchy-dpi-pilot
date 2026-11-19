@@ -62,7 +62,6 @@ Item {
   readonly property bool warpAvailable: warp.available === true
   readonly property bool warpRunning: warp.running === true
   readonly property bool warpRegistered: warp.registered === true
-  readonly property string warpConflict: warp.conflict ? String(warp.conflict) : ""
   readonly property var warpCheck: warp.check ? warp.check : ({})
   function compactAddress(value) {
     var text = String(value || "")
@@ -78,7 +77,6 @@ Item {
   }
   readonly property string warpText: {
     if (!warpAvailable) return "mihomo не установлен — нажмите, чтобы доустановить"
-    if (warpConflict !== "") return "Недоступен: " + warpConflict
     if (warpRunning) {
       if (warpCheckText !== "") {
         var route = warpCheck.tun === false ? " · маршрут не в туннеле" : ""
@@ -254,10 +252,6 @@ Item {
   function toggleWarp() {
     if (!installed) { installEngine(); return }
     if (busy || generating) return
-    if (warpConflict !== "") {
-      flash("Сначала выключите omarchy-usque")
-      return
-    }
     if (!warpAvailable) {
       startAction("install", ["pkexec", bin, "setup"], "Установка mihomo…")
       return
@@ -544,7 +538,6 @@ Item {
             isOn: root.warpRunning
             attention: root.warp.failed === true
             busy: root.busy || root.generating
-            accentColor: root.warpConflict !== "" ? root.faint : root.accent
             onToggled: root.toggleWarp()
           }
 

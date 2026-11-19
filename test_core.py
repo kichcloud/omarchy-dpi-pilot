@@ -382,15 +382,9 @@ class WarpTest(unittest.TestCase):
         self.assertEqual(self.mod.cidr_of("2606:4700::2", 6), "2606:4700::2/128")
         self.assertEqual(self.mod.cidr_of("bad", 4), "")
 
-    def test_conflict_detection_reports_active_usque(self):
-        from unittest import mock
-        mod = self.mod
-        with mock.patch.object(mod.subprocess, "run", return_value=subprocess.CompletedProcess(
-                ["systemctl"], 0, "active\n", "")):
-            self.assertTrue(mod.warp_conflict())
-        with mock.patch.object(mod.subprocess, "run", return_value=subprocess.CompletedProcess(
-                ["systemctl"], 3, "inactive\n", "")):
-            self.assertEqual(mod.warp_conflict(), "")
+    def test_no_usque_conflict_guard(self):
+        # A third-party tunnel must never block toggling WARP on or off.
+        self.assertNotIn("usque", BIN.read_text(encoding="utf-8").lower())
 
     def test_config_passes_mihomo_validation(self):
         binary = os.environ.get("KICH_DPI_MIHOMO")
@@ -840,7 +834,7 @@ class BatchedStatusTest(unittest.TestCase):
 
     def test_parses_multi_unit_show_output(self):
         from unittest import mock
-        units = [self.mod.UNIT, self.mod.WARP_UNIT, "omarchy-usque.service"]
+        units = [self.mod.UNIT, self.mod.WARP_UNIT, self.mod.CONFLICT_UNIT]
         out = ("%s\nactive\nenabled\n\n"
                "%s\ninactive\nnot-found\n\n"
                "%s\nactive\n\n" % (units[0], units[1], units[2]))
@@ -893,8 +887,7 @@ class WarpEnablementTest(unittest.TestCase):
             calls.append(args)
             return subprocess.CompletedProcess(args, 0, "", "")
 
-        with mock.patch.object(self.mod, "warp_conflict", lambda: ""), \
-             mock.patch.object(self.mod, "warp_available", lambda: True), \
+        with mock.patch.object(self.mod, "warp_available", lambda: True), \
              mock.patch.object(self.mod, "warp_account", lambda: {"id": "test"}), \
              mock.patch.object(self.mod, "warp_build", lambda account: None), \
              mock.patch.object(self.mod, "warp_systemctl", fake), \
@@ -1028,8 +1021,7 @@ class DoctorServiceTest(unittest.TestCase):
     def _doctor(self, running, failed, active):
         from unittest import mock
         warp = {"available": True, "registered": True, "account": "x",
-                "running": running, "failed": failed, "active": active,
-                "conflict": ""}
+                "running": running, "failed": failed, "active": active}
         state = {"failed": failed, "active": active, "running": running,
                  "active_name": "strategy", "conflict": False, "warp": warp}
         captured = {}

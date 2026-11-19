@@ -34,7 +34,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-VERSION = "0.7.0"
+VERSION = "0.7.1"
 
 UNIT = "kich-dpi.service"
 TABLE = "kich_dpi"
@@ -265,15 +265,6 @@ def systemctl(*args, timeout=25, unit=UNIT):
         return subprocess.CompletedProcess(["systemctl", *args, unit], 1, "", str(exc))
 
 
-def service_active(unit):
-    """True when a unit is active; any failure to ask counts as inactive."""
-    try:
-        return subprocess.run(["systemctl", "is-active", unit], capture_output=True,
-                              text=True, timeout=4).stdout.strip() == "active"
-    except (OSError, subprocess.SubprocessError):
-        return False
-
-
 def unit_state(unit=UNIT, path=UNIT_PATH, missing_ok=True):
     """(active, enabled) for a unit. `missing_ok` keeps an installed engine
     reporting a real state even while its unit file is not written yet."""
@@ -288,7 +279,7 @@ def batched_unit_states(units):
     """Active/enabled for several units from ONE `systemctl show` call.
 
     A status poll used to spawn six `systemctl` processes (is-active and
-    is-enabled for DPI, WARP and the two conflicting tunnels). Quickshell
+    is-enabled for DPI, WARP and the conflicting zapret2 service). Quickshell
     re-runs `status` every couple of seconds, so those forks — not the
     toggles — dominate process churn. Coalescing them into a single query
     keeps the CLI interface unchanged while cutting six spawns to one.
@@ -1712,30 +1703,19 @@ def warp_build(account=None):
     return WARP_CONFIG
 
 
-def warp_conflict():
-    if service_active("omarchy-usque.service"):
-        return "туннель omarchy-usque активен"
-    return ""
-
-
 def warp_status(_states=None):
     """Return WARP state. When called from `status_data`, pass the already
     batched unit states so we don't spawn another systemctl process."""
     if _states is not None:
         active, enabled = _states[WARP_UNIT]
-        conflict = ("туннель omarchy-usque активен"
-                    if _states.get("omarchy-usque.service", ("", ""))[0] == "active" else "")
     else:
         active, enabled = warp_unit_state()
-        conflict = warp_conflict()
     account = warp_account()
     check = read_dict(WARP_CHECK_FILE)
     available = warp_available()
     error = ""
     if not available:
         error = "mihomo не установлен"
-    elif conflict:
-        error = conflict
     elif active == "failed":
         error = "служба WARP не запустилась"
     return {
@@ -1746,7 +1726,6 @@ def warp_status(_states=None):
         "failed": active == "failed",
         "active": active,
         "enabled": enabled,
-        "conflict": conflict,
         "name": str(account.get("name") or ""),
         "account": str(account.get("id") or "")[:8],
         "check": check,
@@ -1764,9 +1743,6 @@ def cmd_warp_config():
 
 
 def cmd_warp_on():
-    conflict = warp_conflict()
-    if conflict:
-        raise Fail("%s — выключите его, два туннеля конфликтуют" % conflict)
     if not warp_available():
         raise Fail("mihomo не установлен: сначала установите плагин")
     account = warp_account()
@@ -1879,13 +1855,12 @@ def progress_data():
 
 
 CONFLICT_UNIT = "omarchy-zapret2.service"
-USQUE_UNIT = "omarchy-usque.service"
 
 
 def status_data():
     version, is_installed = engine_info()
     # One systemctl call instead of six — see batched_unit_states().
-    states = batched_unit_states([UNIT, WARP_UNIT, CONFLICT_UNIT, USQUE_UNIT])
+    states = batched_unit_states([UNIT, WARP_UNIT, CONFLICT_UNIT])
     active, enabled = states[UNIT]
     running = active == "active"
     failed = active == "failed"
@@ -2380,7 +2355,6 @@ def cmd_doctor():
     add("mihomo", warp["available"], mihomo_version())
     add("аккаунт WARP", warp["registered"], warp["account"])
     add("служба WARP", warp["running"], service_detail(warp))
-    add("конфликт WARP", not warp["conflict"], warp["conflict"] or "нет")
     if state["active_name"]:
         add("стратегия", True, state["active_name"])
     out({"ok": True, "checks": checks, "status": state})

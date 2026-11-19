@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "kich.dpi-pilot",
   "name": "DPI Pilot",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "author": "kich",
   "license": "MIT",
   "description": "Stock Omarchy network panel (connection stats, Wi-Fi, DNS provider) with a collapsible DPI Pilot drawer: zapret2 DPI bypass, WARP MASQUE tunnel, strategy generation and service checks.",
