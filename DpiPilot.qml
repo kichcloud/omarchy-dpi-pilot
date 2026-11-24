@@ -7,7 +7,7 @@ import Quickshell.Networking
 import qs.Ui
 import qs.Commons
 import qs.Commons as Commons
-import "Model.js" as Model
+import "NetworkModel.js" as Model
 
 Panel {
   id: root
@@ -16,6 +16,27 @@ Panel {
   // manageIpc: false so this panel can own the single IpcHandler the target
   // permits — needed for the toggleNetwork method below.
   manageIpc: false
+
+  // ---- DPI Pilot drawer -------------------------------------------------
+  // The popup content is loaded lazily by KeyboardPanel, so the drawer cannot
+  // be referenced by id from the Panel root. It publishes itself through
+  // drawerReady/drawerGone instead, like it did before the rewrite.
+  property bool dpiExpanded: false
+  property var dpiDrawerItem: null
+  property string dpiPending: ""
+  readonly property bool dpiUnhealthy: dpiDrawerItem ? dpiDrawerItem.unhealthy : false
+
+  function dpiRun(d, name) {
+    // The panel owns the readiness queue; the drawer owns the action table.
+    if (d) d.ipc(name)
+  }
+
+  function dpiInvoke(name) {
+    root.dpiExpanded = true
+    root.open()
+    if (dpiDrawerItem) dpiRun(dpiDrawerItem, name)
+    else root.dpiPending = name
+  }
 
   // Centralized close so callers can't forget to drop the passphrase prompt.
   function close() {
@@ -103,8 +124,8 @@ Panel {
   property string passwordText: ""
   property string identityText: ""
 
-  // ConnectionFailReason values as a plain object, so Model.js helpers stay
-  // pure JS and Node-testable.
+  // ConnectionFailReason values as a plain object, so NetworkModel.js helpers
+  // stay pure JS and Node-testable.
   readonly property var connectionFailReasons: ({
     NoSecrets: ConnectionFailReason.NoSecrets,
     WifiAuthTimeout: ConnectionFailReason.WifiAuthTimeout,
@@ -159,7 +180,10 @@ Panel {
   readonly property bool speedHeaderHasCursor: cursorActive && focusSection === "header" && headerIndex === speedHeaderIndex
   readonly property bool toggleHeaderHasCursor: cursorActive && focusSection === "header" && headerIndex === toggleHeaderIndex
   readonly property string toggleHint: Networking.wifiEnabled ? Commons.I18n.t("network.turnWifiOff") : Commons.I18n.t("network.turnWifiOn")
-  readonly property var dnsProviders: ["DHCP", "Cloudflare", "Google", "Custom"]
+  // China offers Alibaba's resolver in place of Cloudflare's and Google's
+  // (docs/regions.md); the region comes with the DNS reading.
+  property string region: "global"
+  readonly property var dnsProviders: region === "cn" ? ["DHCP", "AliDNS", "Custom"] : ["DHCP", "Cloudflare", "Google", "Custom"]
   property int dnsIndex: 0
   // ["2.4", "5", ...], or empty when there is nothing to choose between.
   // Wi-Fi only: on Ethernet the band of a secondary radio is not what the
@@ -247,40 +271,25 @@ Panel {
     function checkConnectivity() { root.checkConnectivity() }
   }
 
-  // ---- DPI Pilot drawer -------------------------------------------------
-  property bool dpiExpanded: false
-  property var dpiDrawerItem: null
-  property string dpiPending: ""
-
-  function dpiRun(d, name) {
-    if (!d) return
-    if (name === "service") d.toggleBypass()
-    else if (name === "warp") d.toggleWarp()
-    else if (name === "check") d.runCheck()
-    else if (name === "generate") d.runGenerate()
-    else if (name === "refresh") d.refresh()
-  }
-
-  function dpiInvoke(name) {
-    root.dpiExpanded = true
-    root.open()
-    if (dpiDrawerItem) dpiRun(dpiDrawerItem, name)
-    else root.dpiPending = name
-  }
-
-  // Keep the old kich.dpi-pilot IPC target alive for existing keybinds.
+  // Backward-compatible DPI Pilot IPC target. All DPI actions go through the
+  // drawer, so a keybind arriving before the first status reply is queued.
   ShellIpc {
     target: "kich.dpi-pilot"
 
     function open() { root.open() }
     function close() { root.close() }
-    function toggle() { root.open() }
+    function show() { root.open() }
+    function hide() { root.close() }
+    function toggle() { root.opened ? root.close() : root.open() }
     function dpi() { root.dpiExpanded = true; root.open() }
     function dpiToggle() { root.dpiExpanded = !root.dpiExpanded; root.open() }
     function service() { root.dpiInvoke("service") }
     function warp() { root.dpiInvoke("warp") }
     function check() { root.dpiInvoke("check") }
+    function doctor() { root.dpiInvoke("doctor") }
+    function warpCheck() { root.dpiInvoke("warp-check") }
     function generate() { root.dpiInvoke("generate") }
+    function repair() { root.dpiInvoke("repair") }
     function refresh() { root.dpiInvoke("refresh") }
   }
 
@@ -649,7 +658,7 @@ Panel {
     if (scanWifi === undefined) scanWifi = false
     if (!detailsProc.running) detailsProc.running = true
     if (!dnsProc.running) {
-      dnsProc.command = ["bash", "-c", root.dnsCommand("")]
+      dnsProc.command = ["bash", "-c", root.dnsCommand("") + "; omarchy-region"]
       dnsProc.running = true
     }
     if (!bandProc.running) {
@@ -803,9 +812,11 @@ Panel {
     return Model.wifiIconFor(strength)
   }
 
+  // The provider on the first line, the region on the second.
   function updateDns(raw) {
-    var value = String(raw || "").trim()
-    dnsProvider = value || "DHCP"
+    var lines = String(raw || "").trim().split("\n")
+    dnsProvider = lines[0].trim() || "DHCP"
+    region = (lines[1] || "").trim() || "global"
   }
 
   function updateBand(raw) {
@@ -1186,9 +1197,11 @@ Panel {
     anchors.fill: parent
     bar: root.bar
     text: root.icon
-    active: root.restricted
+    active: root.restricted || root.dpiUnhealthy
+    activeColor: bar ? bar.urgent : Commons.Color.urgent
     tooltipText: root.hasCaptivePortal ? Commons.I18n.t("network.signInToNetwork")
-      : (root.restricted ? Commons.I18n.t("network.limitedAccess") : "")
+      : (root.restricted ? Commons.I18n.t("network.limitedAccess")
+        : (root.dpiUnhealthy ? "DPI Pilot: требуется внимание" : ""))
 
     onPressed: function(b) {
       if (root.opened) root.close()
@@ -1695,39 +1708,21 @@ Panel {
           width: parent.width
           spacing: Style.space(6)
 
-          readonly property int count: 4
+          readonly property int count: root.dnsProviders.length
           readonly property real cellWidth: (width - spacing * (count - 1)) / count
 
-          DnsProviderPill {
-            provider: "DHCP"
-            index: 0
-            tooltipText: Commons.I18n.t("network.dnsFromDhcp")
-            width: dnsRow.cellWidth
-            onClicked: root.setDns(provider)
-          }
+          Repeater {
+            model: root.dnsProviders
 
-          DnsProviderPill {
-            provider: "Cloudflare"
-            index: 1
-            tooltipText: Commons.I18n.t("network.setDnsTo").arg("Cloudflare")
-            width: dnsRow.cellWidth
-            onClicked: root.setDns(provider)
-          }
-
-          DnsProviderPill {
-            provider: "Google"
-            index: 2
-            tooltipText: Commons.I18n.t("network.setDnsTo").arg("Google")
-            width: dnsRow.cellWidth
-            onClicked: root.setDns(provider)
-          }
-
-          DnsProviderPill {
-            provider: "Custom"
-            index: 3
-            tooltipText: Commons.I18n.t("network.setCustomDns")
-            width: dnsRow.cellWidth
-            onClicked: root.setDns(provider)
+            DnsProviderPill {
+              required property string modelData
+              provider: modelData
+              tooltipText: modelData === "DHCP" ? Commons.I18n.t("network.dnsFromDhcp")
+                : modelData === "Custom" ? Commons.I18n.t("network.setCustomDns")
+                : Commons.I18n.t("network.setDnsTo").arg(modelData)
+              width: dnsRow.cellWidth
+              onClicked: root.setDns(provider)
+            }
           }
         }
       }
@@ -1812,14 +1807,13 @@ Panel {
         foreground: root.bar.foreground
       }
 
-      // DPI Pilot drawer. The header inside DpiSection.qml is the disclosure
-      // control. DpiSection is instantiated directly (not through a Loader,
-      // which would freeze its implicitHeight at load time and leave empty
-      // space in the popup when the details collapse).
+      // The header inside DpiSection.qml is the disclosure control. Kept as a
+      // direct child (not a Loader) so its collapsed height is never stale.
       DpiSection {
         id: dpiDrawer
         width: parent.width
         bar: root.bar
+        active: root.opened
         expanded: root.dpiExpanded
         onToggleRequested: root.dpiExpanded = !root.dpiExpanded
 
