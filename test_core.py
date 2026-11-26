@@ -373,7 +373,12 @@ class InstallTest(SandboxTest):
             argv = [str(a) for a in argv]
             calls.append(argv)
             out = ""
-            if argv[:3] == ["systemctl", "is-enabled", C.UNIT]:
+            if argv[:2] == ["systemctl", "show"]:
+                out = "\n\n".join(
+                    "%s\ninactive\n%s" % (
+                        unit, "enabled" if enabled.get(unit, True) else "disabled")
+                    for unit in (C.UNIT, C.WARP_UNIT)) + "\n"
+            elif argv[:3] == ["systemctl", "is-enabled", C.UNIT]:
                 out = "enabled\n" if enabled.get(C.UNIT, True) else "disabled\n"
             elif argv[:3] == ["systemctl", "is-enabled", C.WARP_UNIT]:
                 out = "enabled\n" if enabled.get(C.WARP_UNIT, True) else "disabled\n"
@@ -406,6 +411,10 @@ class InstallTest(SandboxTest):
         def run(argv, **kwargs):
             argv = [str(a) for a in argv]
             calls.append(argv)
+            if argv[:2] == ["systemctl", "show"]:
+                out = "\n\n".join("%s\ninactive\nenabled" % unit
+                                  for unit in (C.UNIT, C.WARP_UNIT)) + "\n"
+                return completed(argv, 0, out, "")
             if argv[:2] == ["systemctl", "is-enabled"]:
                 return completed(argv, 0, "enabled\n", "")
             if argv[:2] == ["sysctl", "-n"]:
@@ -441,6 +450,11 @@ class InstallTest(SandboxTest):
         self.assertNotIn(["systemctl", "enable", C.WARP_UNIT], calls)
         self.assertNotIn(["sysctl", "-q", "-w",
                           "net.netfilter.nf_conntrack_tcp_be_liberal=1"], calls)
+
+    def test_install_queries_unit_state_once(self):
+        calls = self._install({C.UNIT: True, C.WARP_UNIT: True})
+        self.assertEqual(len([c for c in calls if c[:2] == ["systemctl", "show"]]), 1)
+        self.assertEqual([c for c in calls if c[:2] == ["systemctl", "is-enabled"]], [])
 
     def test_setup_migrates_old_choice_into_state(self):
         self._install({C.UNIT: False, C.WARP_UNIT: True})

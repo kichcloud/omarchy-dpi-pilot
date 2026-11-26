@@ -37,9 +37,12 @@ def install_system(user):
     except KeyError:
         group = user.pw_name
     home = Path(user.pw_dir)
-    legacy = legacy_enabled_states()
-    needs_enable = {unit: installer.needs_enabling(unit)
-                    for unit in (C.UNIT, C.WARP_UNIT)}
+    states = core.batched_unit_states([C.UNIT, C.WARP_UNIT])
+    needs_enable = {
+        unit: states[unit][1] in ("", "not-found", "disabled",
+                                  "masked", "masked-runtime")
+        for unit in (C.UNIT, C.WARP_UNIT)
+    }
 
     changed = False
     files = (
@@ -65,6 +68,10 @@ def install_system(user):
     state_dir = merge_config_into_state(home, user.pw_uid, user.pw_gid)
     state_path = state_dir / "state.json"
     if not state_path.exists():
+        legacy = {
+            unit: states[unit][1] not in ("disabled", "masked", "masked-runtime")
+            for unit in (C.UNIT, C.WARP_UNIT)
+        }
         core.write_json(state_path, {
             "version": 1, "dpi": legacy[C.UNIT], "warp": legacy[C.WARP_UNIT],
         })
