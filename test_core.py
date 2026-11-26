@@ -1064,12 +1064,71 @@ class WarpEnablementTest(SandboxTest):
 
         return calls, fake, unit_state
 
+    def test_warp_unit_state_uses_one_systemctl_show(self):
+        C.WARP_UNIT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        C.WARP_UNIT_PATH.write_text("[Unit]\n", encoding="utf-8")
+        out = "%s\nactive\nenabled\n" % C.WARP_UNIT
+        with mock.patch.object(core.subprocess, "run",
+                               return_value=completed([], 0, out, "")) as run:
+            state = warp.warp_unit_state()
+        self.assertEqual(state, ("active", "enabled"))
+        self.assertEqual(run.call_count, 1)
+        self.assertIn("show", run.call_args.args[0])
+
+    def test_warp_off_reads_the_unit_once_and_reuses_it_for_status(self):
+        reads = []
+
+        def unit_state():
+            reads.append(1)
+            return ("active", "enabled")
+
+        seen = {}
+
+        def status(**kwargs):
+            seen.update(kwargs)
+            return {}
+
+        with mock.patch.object(warp, "warp_unit_state", unit_state), \
+             mock.patch.object(warp, "warp_systemctl", lambda *a, **k: completed(a)), \
+             mock.patch.object(warp, "warp_status", status), \
+             mock.patch.object(core, "out", lambda payload: None):
+            warp.cmd_warp_off()
+        self.assertEqual(len(reads), 1)
+        self.assertEqual(seen["_states"][C.WARP_UNIT], ("inactive", "enabled"))
+
+    def test_warp_on_reads_the_unit_once_when_healthy(self):
+        reads = []
+
+        def unit_state():
+            reads.append(1)
+            return ("active", "enabled")
+
+        stamps = [{"version": 1, "account": "test"}] * 2
+        seen = {}
+
+        def status(**kwargs):
+            seen.update(kwargs)
+            return {}
+
+        with mock.patch.object(warp, "warp_available", lambda: True), \
+             mock.patch.object(warp, "warp_account", lambda: {"id": "test"}), \
+             mock.patch.object(warp, "warp_build", lambda account: None), \
+             mock.patch.object(warp, "warp_build_stamp", side_effect=stamps), \
+             mock.patch.object(warp, "warp_check_data", lambda: {"ok": True}), \
+             mock.patch.object(warp, "warp_unit_state", unit_state), \
+             mock.patch.object(warp, "warp_systemctl", lambda *a, **k: completed(a)), \
+             mock.patch.object(warp, "warp_status", status), \
+             mock.patch.object(core, "out", lambda payload: None):
+            warp.cmd_warp_on()
+        self.assertEqual(len(reads), 1)
+        self.assertEqual(seen["_states"][C.WARP_UNIT], ("active", "enabled"))
+
     def test_warp_off_stops_and_remembers(self):
         calls, fake, unit_state = self._recorder(True)
 
         with mock.patch.object(warp, "warp_systemctl", fake), \
              mock.patch.object(warp, "warp_unit_state", unit_state), \
-             mock.patch.object(warp, "warp_status", lambda: {}), \
+             mock.patch.object(warp, "warp_status", lambda *a, **k: {}), \
              mock.patch.object(core, "out", lambda payload: None):
             warp.cmd_warp_off()
         self.assertEqual([c[0] for c in calls], ["stop"])
@@ -1084,7 +1143,7 @@ class WarpEnablementTest(SandboxTest):
              mock.patch.object(warp, "warp_check_data", lambda: {"ok": False}), \
              mock.patch.object(warp, "warp_unit_state", unit_state), \
              mock.patch.object(warp, "warp_systemctl", fake), \
-             mock.patch.object(warp, "warp_status", lambda: {}), \
+             mock.patch.object(warp, "warp_status", lambda *a, **k: {}), \
              mock.patch.object(core, "out", lambda payload: None):
             warp.cmd_warp_on()
         self.assertEqual([c[0] for c in calls], ["restart"])
@@ -1103,7 +1162,7 @@ class WarpEnablementTest(SandboxTest):
              mock.patch.object(warp, "warp_check_data", lambda: {"ok": True}), \
              mock.patch.object(warp, "warp_unit_state", unit_state), \
              mock.patch.object(warp, "warp_systemctl", fake), \
-             mock.patch.object(warp, "warp_status", lambda: {}), \
+             mock.patch.object(warp, "warp_status", lambda *a, **k: {}), \
              mock.patch.object(core, "out", lambda payload: None):
             warp.cmd_warp_on()
         self.assertEqual(calls, [])
@@ -1121,7 +1180,7 @@ class WarpEnablementTest(SandboxTest):
              mock.patch.object(warp, "warp_check_data", lambda: {"ok": False}), \
              mock.patch.object(warp, "warp_unit_state", unit_state), \
              mock.patch.object(warp, "warp_systemctl", fake), \
-             mock.patch.object(warp, "warp_status", lambda: {}), \
+             mock.patch.object(warp, "warp_status", lambda *a, **k: {}), \
              mock.patch.object(core, "out", lambda payload: None):
             warp.cmd_warp_on()
         self.assertEqual([c[0] for c in calls], ["restart"])
@@ -1131,13 +1190,23 @@ class WarpEnablementTest(SandboxTest):
 
         with mock.patch.object(warp, "warp_unit_state", unit_state), \
              mock.patch.object(warp, "warp_systemctl", fake), \
-             mock.patch.object(warp, "warp_status", lambda: {}), \
+             mock.patch.object(warp, "warp_status", lambda *a, **k: {}), \
              mock.patch.object(core, "out", lambda payload: None):
             warp.cmd_warp_off()
         self.assertEqual(calls, [])
 
 
 class DpiToggleTest(SandboxTest):
+    def test_is_running_reads_only_the_active_state(self):
+        with mock.patch.object(core, "installed", lambda: True), \
+             mock.patch.object(core.subprocess, "run",
+                               return_value=completed([], 0, "active\n", "")) as run:
+            self.assertTrue(core.is_running())
+        self.assertEqual(run.call_count, 1)
+        argv = run.call_args.args[0]
+        self.assertEqual(argv[:2], ["systemctl", "is-active"])
+        self.assertNotIn("is-enabled", argv)
+
     def _systemctl_recorder(self):
         calls = []
         state = {"active": False}

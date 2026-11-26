@@ -16,8 +16,9 @@ def warp_systemctl(warp, *args, timeout=25):
 
 
 def warp_unit_state(warp):
-    return warp.core.unit_state(warp.C.WARP_UNIT, warp.C.WARP_UNIT_PATH,
-                                missing_ok=False)
+    if not warp.C.WARP_UNIT_PATH.exists():
+        return "inactive", "not-found"
+    return warp.core.batched_unit_states([warp.C.WARP_UNIT])[warp.C.WARP_UNIT]
 
 
 def install_rule_lists(warp):
@@ -225,7 +226,7 @@ def cmd_warp_on(warp):
     after = warp.warp_build_stamp()
     changed = before != after or not had_config
     warp.core.set_wanted("warp", True)
-    active, _enabled = warp.warp_unit_state()
+    active, enabled = warp.warp_unit_state()
     healthy = False
     if not changed and active == "active":
         healthy = bool(warp.warp_check_data().get("ok"))
@@ -233,16 +234,20 @@ def cmd_warp_on(warp):
         action = "restart" if active == "active" else "start"
         warp.core.checked_unit_call(warp.warp_systemctl, action,
                                     "не удалось включить WARP", 35)
-    warp.core.out({"ok": True, "warp": warp.warp_status()})
+        active = "active"
+    states = {warp.C.WARP_UNIT: (active, enabled)}
+    warp.core.out({"ok": True, "warp": warp.warp_status(_states=states)})
 
 
 def cmd_warp_off(warp):
-    active, _enabled = warp.warp_unit_state()
+    active, enabled = warp.warp_unit_state()
     warp.core.set_wanted("warp", False)
     if active == "active":
         warp.core.checked_unit_call(warp.warp_systemctl, "stop",
                                     "не удалось отключить WARP", 25)
-    warp.core.out({"ok": True, "warp": warp.warp_status()})
+        active = "inactive"
+    states = {warp.C.WARP_UNIT: (active, enabled)}
+    warp.core.out({"ok": True, "warp": warp.warp_status(_states=states)})
 
 
 def cmd_warp_toggle(warp):

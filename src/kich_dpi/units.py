@@ -56,4 +56,7 @@ def batched_unit_states(units):
 
 
 def is_running():
-    return core.unit_state()[0] == "active"
+    """Active state only: one `systemctl is-active`, no `is-enabled`."""
+    if not C.UNIT_PATH.exists() and not core.installed():
+        return False
+    return (core.systemctl("is-active").stdout or "").strip() == "active"
