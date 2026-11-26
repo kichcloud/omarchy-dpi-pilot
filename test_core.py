@@ -4,6 +4,7 @@ Every test imports the package from ``src/`` instead of loading the root
 launcher. All paths the code can touch (HOME, /opt, /etc, systemd units) are
 patched to a temporary tree, so a test run never changes the machine.
 """
+import gzip
 import hashlib
 import io
 import ipaddress
@@ -283,6 +284,70 @@ class EngineExtractTest(SandboxTest):
         manifest = json.loads((ROOT / "manifest.json").read_text(encoding="utf-8"))
         self.assertEqual(manifest["version"], "0.8.0")
         self.assertEqual(C.VERSION, manifest["version"])
+
+
+class MihomoInstallTest(SandboxTest):
+    """install_mihomo must record its stamp and never crash after installing."""
+
+    def _archive(self):
+        path = self.base / "mihomo.gz"
+        with gzip.open(path, "wb") as fh:
+            fh.write(b"#!/bin/sh\nexit 0\n")
+        return path
+
+    def _run(self, output="Mihomo Meta v1.19.0 linux amd64\n"):
+        calls = []
+
+        def run(argv, **kwargs):
+            calls.append([str(a) for a in argv])
+            return completed(argv, 0, output, "")
+
+        return calls, run
+
+    def test_install_records_the_installed_version(self):
+        C.ENGINE_ROOT.mkdir(parents=True, exist_ok=True)
+        calls, run = self._run()
+        with mock.patch.dict(os.environ,
+                             {"KICH_DPI_MIHOMO_ARCHIVE": str(self._archive())}), \
+             mock.patch.object(core, "machine_arch", lambda: "x86_64"), \
+             mock.patch.object(core, "run", side_effect=run):
+            version = engine.install_mihomo()
+        self.assertEqual(version, "custom")
+        stamp = json.loads((C.ENGINE_ROOT / "mihomo.json").read_text(encoding="utf-8"))
+        self.assertEqual(stamp["version"], "custom")
+        self.assertGreater(stamp["installed"], 0)
+        self.assertTrue(C.MIHOMO.is_file())
+        self.assertEqual(C.MIHOMO.stat().st_mode & 0o777, 0o755)
+
+    def test_second_install_does_not_touch_disk_or_spawn(self):
+        C.ENGINE_ROOT.mkdir(parents=True, exist_ok=True)
+        _, run = self._run()
+        with mock.patch.dict(os.environ,
+                             {"KICH_DPI_MIHOMO_ARCHIVE": str(self._archive())}), \
+             mock.patch.object(core, "machine_arch", lambda: "x86_64"), \
+             mock.patch.object(core, "run", side_effect=run):
+            engine.install_mihomo()
+        before = {path.name: path.read_bytes() for path in C.ENGINE_ROOT.iterdir()
+                  if path.is_file()}
+        with mock.patch.object(core, "run",
+                               side_effect=AssertionError("must not spawn")):
+            again = engine.install_mihomo()
+        after = {path.name: path.read_bytes() for path in C.ENGINE_ROOT.iterdir()
+                 if path.is_file()}
+        self.assertEqual(again, "custom")
+        self.assertEqual(before, after)
+
+    def test_missing_stamp_is_healed_from_the_binary(self):
+        C.ENGINE_ROOT.mkdir(parents=True, exist_ok=True)
+        C.MIHOMO.write_bytes(b"#!/bin/sh\n")
+        C.MIHOMO.chmod(0o755)
+        with mock.patch.object(
+                core, "run",
+                return_value=completed([], 0, "Mihomo Meta v1.18.8 linux\n", "")):
+            version = engine.install_mihomo()
+        self.assertEqual(version, "1.18.8")
+        stamp = json.loads((C.ENGINE_ROOT / "mihomo.json").read_text(encoding="utf-8"))
+        self.assertEqual(stamp["version"], "1.18.8")
 
 
 class InstallTest(SandboxTest):

@@ -8,6 +8,7 @@ import os
 import shutil
 import tarfile
 import tempfile
+import time
 from pathlib import Path
 
 from . import constants as C
@@ -282,13 +283,37 @@ def extract_engine(archive, tag):
     return target
 
 
+def _record_mihomo(version, digest=""):
+    """Persist which binary is installed; content-compare keeps this a no-op."""
+    core.write_json(C.ENGINE_ROOT / "mihomo.json", {
+        "version": version, "installed": int(time.time()), "sha256": digest,
+    })
+
+
+def _mihomo_version_from_binary():
+    """Best-effort version of an already-installed binary (heals a lost stamp)."""
+    cp = core.run([str(C.MIHOMO), "-v"], timeout=10)
+    text = ((cp.stdout or "") + " " + (cp.stderr or "")).strip()
+    for token in text.split():
+        candidate = token.lstrip("v").rstrip(",;")
+        if candidate[:1].isdigit() and "." in candidate:
+            return candidate
+    return ""
+
+
 def install_mihomo():
     """Download mihomo next to the DPI engine. Root only; called from setup."""
     if warp.warp_available():
-        return warp.mihomo_version()
+        version = warp.mihomo_version()
+        if not version:
+            version = _mihomo_version_from_binary()
+            if version:
+                _record_mihomo(version)
+        return version
     arch = {"x86_64": "amd64", "arm64": "arm64"}.get(core.machine_arch())
     if not arch:
         raise core.Fail("нет сборки mihomo для архитектуры %s" % core.machine_arch())
+    C.ENGINE_ROOT.mkdir(parents=True, exist_ok=True)
 
     local = os.environ.get("KICH_DPI_MIHOMO_ARCHIVE")
     if local:
@@ -355,7 +380,5 @@ def install_mihomo():
             target.unlink(missing_ok=True)
             raise core.Fail("скачанный mihomo не запускается")
         os.replace(target, C.MIHOMO)
-    core.write_json(C.ENGINE_ROOT / "mihomo.json", {
-        "version": tag, "installed": int(time.time()), "sha256": digest,
-    })
+    _record_mihomo(tag, digest)
     return tag
