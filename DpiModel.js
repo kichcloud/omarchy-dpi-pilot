@@ -148,6 +148,12 @@ function diagnosticError(summary) {
 
 // pkexec/polkit can print extra lines around the single JSON envelope. Read
 // the last non-empty line so a noisy stdout cannot be mistaken for failure.
+// A reply that started before the latest user action is stale: applying it
+// would roll the toggle/status back for one poll interval.
+function staleReply(startedAt, current) {
+  return startedAt !== current
+}
+
 function parseJsonOutput(text) {
   var lines = String(text || "").split("\n")
   for (var i = lines.length - 1; i >= 0; i--) {
@@ -274,6 +280,7 @@ if (typeof module !== "undefined") {
     hasProblem: hasProblem, diagnosticLine: diagnosticLine,
     diagnosticProblem: diagnosticProblem, diagnosticError: diagnosticError,
     actionResult: actionResult, parseJsonOutput: parseJsonOutput,
+    staleReply: staleReply,
     invoke: invoke,
   }
 }

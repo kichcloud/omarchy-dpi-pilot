@@ -2195,6 +2195,10 @@ class DpiModelJsTest(unittest.TestCase):
         self.assertEqual(cp.returncode, 0, cp.stderr)
         return json.loads(cp.stdout)
 
+    def test_status_reply_is_stale_after_a_newer_action(self):
+        self.assertTrue(self.call("staleReply", 1, 2))
+        self.assertFalse(self.call("staleReply", 2, 2))
+
     def test_compact_address_keeps_short_and_non_ipv6_values(self):
         self.assertEqual(self.call("compactAddress", "1.2.3.4"), "1.2.3.4")
         self.assertEqual(self.call("compactAddress", "abcd::1"), "abcd::1")
@@ -2395,6 +2399,14 @@ class QmlCliContractTest(unittest.TestCase):
         cls.pilot = (ROOT / "DpiPilot.qml").read_text(encoding="utf-8")
         cls.section = (ROOT / "DpiSection.qml").read_text(encoding="utf-8")
         cls.model = (ROOT / "DpiModel.js").read_text(encoding="utf-8")
+
+    def test_section_drops_status_replies_older_than_an_action(self):
+        self.assertIn("property int actionGeneration", self.section)
+        self.assertIn("property int statusGeneration", self.section)
+        self.assertIn("statusGeneration = actionGeneration", self.section)
+        self.assertIn("actionGeneration += 1", self.section)
+        self.assertIn("DpiModel.staleReply(root.statusGeneration, "
+                      "root.actionGeneration)", self.section)
 
     def test_merged_widget_owns_both_network_and_dpi(self):
         self.assertIn('moduleName: "kich.dpi-pilot"', self.pilot)

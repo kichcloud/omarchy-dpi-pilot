@@ -43,6 +43,10 @@ Item {
   property string flashText: ""
   property bool advanced: false
   property bool removeArmed: false
+  // Ignore a status reply that started before the latest action, so a slow
+  // poll cannot overwrite the fresher result of toggle/repair/generate.
+  property int actionGeneration: 0
+  property int statusGeneration: 0
 
   readonly property string bin: {
     var path = String(Qt.resolvedUrl("kich-dpi") || "")
@@ -274,7 +278,9 @@ Item {
   }
 
   function refresh() {
-    if (!statusProc.running) statusProc.running = true
+    if (statusProc.running) return
+    statusGeneration = actionGeneration
+    statusProc.running = true
   }
 
   function flash(text) {
@@ -311,6 +317,7 @@ Item {
   }
 
   function startAction(name, command, label) {
+    actionGeneration += 1
     if (actionProc.running) {
       queuedActions.push({name: name, command: command, label: label})
       return
@@ -691,6 +698,7 @@ Item {
     stdout: StdioCollector { id: statusOut }
     stderr: StdioCollector { id: statusErr }
     onExited: function(code) {
+      if (DpiModel.staleReply(root.statusGeneration, root.actionGeneration)) return
       root.applyStatus(code, String(statusOut.text || ""), String(statusErr.text || ""))
     }
   }
