@@ -43,6 +43,10 @@ def read_list(path):
     return _io.read_list(path)
 
 
+def to_int(value, default=0):
+    return _io.to_int(value, default)
+
+
 def atomic_write(path, text, mode=None):
     return _io.atomic_write(path, text, mode)
 

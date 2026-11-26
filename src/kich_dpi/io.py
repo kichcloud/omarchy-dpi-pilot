@@ -35,6 +35,20 @@ def read_list(path):
     return data if isinstance(data, list) else []
 
 
+def to_int(value, default=0):
+    """Parse a number that may have been edited by hand; never raise."""
+    if isinstance(value, bool):
+        return int(value)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        pass
+    try:
+        return int(float(str(value).strip()))
+    except (TypeError, ValueError):
+        return default
+
+
 def _sync_directory(path):
     """Make the rename itself durable; not every filesystem supports it."""
     try:

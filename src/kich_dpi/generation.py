@@ -16,8 +16,8 @@ def merge_strategies(strategies, rows):
         by_id[str(item["id"])] = item
     ordered = sorted(
         by_id.values(),
-        key=lambda r: (-int(r.get("health", r.get("passed") or 0)),
-                       int(r.get("ms") or 10 ** 9)),
+        key=lambda r: (-core.to_int(r.get("health", r.get("passed"))),
+                       core.to_int(r.get("ms"), 10 ** 9)),
     )[:8]
     core.write_json(C.STRATEGIES_FILE, ordered)
 
@@ -127,7 +127,7 @@ def generation_cached(strategies, force=False):
         return None
     core = strategies.core
     progress = core.read_dict(C.PROGRESS_FILE)
-    finished = int(progress.get("finished") or 0)
+    finished = core.to_int(progress.get("finished"))
     if progress.get("running") or not finished:
         return None
     if strategies.time.time() - finished > 1800:

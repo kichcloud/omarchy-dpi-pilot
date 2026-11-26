@@ -13,7 +13,7 @@ CONFLICT_UNIT = "omarchy-zapret2.service"
 
 def progress_data():
     data = core.read_dict(C.PROGRESS_FILE)
-    if data.get("running") and time.time() - int(data.get("started") or 0) > 1800:
+    if data.get("running") and time.time() - core.to_int(data.get("started")) > 1800:
         data["running"] = False
         data["error"] = "подбор прерван"
     return data
@@ -27,9 +27,9 @@ def strategy_rows(saved):
             continue
         rows.append({
             "id": str(item.get("id") or ""), "name": str(item.get("name") or ""),
-            "passed": int(item.get("passed") or 0),
-            "total": int(item.get("total") or 0),
-            "ms": int(item.get("ms") or 0), "time": int(item.get("time") or 0),
+            "passed": core.to_int(item.get("passed")),
+            "total": core.to_int(item.get("total")),
+            "ms": core.to_int(item.get("ms")), "time": core.to_int(item.get("time")),
         })
     rows.sort(key=lambda r: (-r["passed"], r["ms"]))
     return rows[:8]

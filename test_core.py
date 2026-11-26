@@ -1383,6 +1383,38 @@ class StateTest(SandboxTest):
         self.assertFalse(data["running"])
         self.assertIn("error", data)
 
+    def test_progress_survives_a_hand_edited_started_field(self):
+        core.write_json(C.PROGRESS_FILE, {"running": True, "started": "oops"})
+        data = status.progress_data()
+        self.assertFalse(data["running"])
+
+    def test_strategy_rows_survive_hand_edited_numbers(self):
+        rows = status.strategy_rows([
+            {"id": "a", "passed": "oops", "total": None, "ms": "1.5", "time": ""},
+            {"id": "b", "passed": 2, "total": 3, "ms": 10, "time": 1},
+        ])
+        self.assertEqual([r["id"] for r in rows], ["b", "a"])
+        self.assertEqual(rows[0]["passed"], 2)
+        self.assertEqual(rows[1]["passed"], 0)
+        self.assertEqual(rows[1]["ms"], 1)
+
+    def test_status_data_survives_a_corrupt_strategies_file(self):
+        core.write_json(C.STRATEGIES_FILE, [{"id": "x", "passed": "oops"}])
+        states = {unit: ("inactive", "disabled")
+                  for unit in (C.UNIT, C.WARP_UNIT, status.CONFLICT_UNIT)}
+        with mock.patch.object(core, "engine_info", lambda: ("", False)), \
+             mock.patch.object(core, "batched_unit_states", lambda units: states):
+            data = status.status_data()
+        self.assertEqual(data["strategies"][0]["passed"], 0)
+
+    def test_merge_strategies_survives_hand_edited_numbers(self):
+        core.write_json(C.STRATEGIES_FILE, [{"id": "old", "passed": "oops",
+                                            "ms": "nope"}])
+        strategies.merge_strategies([{"id": "new", "passed": 3, "ms": 5}])
+        self.assertEqual([r["id"] for r in core.read_list(C.STRATEGIES_FILE)],
+                         ["new", "old"])
+
+
 class StatusTest(SandboxTest):
     def test_status_shape_without_engine(self):
         states = {unit: ("inactive", "not-found")
@@ -1852,6 +1884,13 @@ class RepairTest(SandboxTest):
 
 
 class CoreHelpersTest(SandboxTest):
+    def test_to_int_tolerates_hand_edited_values(self):
+        self.assertEqual(core.to_int("4"), 4)
+        self.assertEqual(core.to_int("1.9"), 1)
+        self.assertEqual(core.to_int(None), 0)
+        self.assertEqual(core.to_int("oops", 7), 7)
+        self.assertEqual(core.to_int(True), 1)
+
     def test_identical_write_preserves_the_file(self):
         path = self.base / "same.txt"
         core.write_text(path, "same\n", 0o600)
