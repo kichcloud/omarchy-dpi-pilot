@@ -202,6 +202,12 @@ pkexec ./kich-dpi remove [--purge]
 перезапускают уже здоровые службы. Флаги `--force` у `warp-config`,
 `warp-register` и `generate` явно обновляют результат заново.
 
+Кэши проб (`check.json`, `warp-check.json`, `progress.json`) считаются
+телеметрией: явные `check`/`repair`/`generate` обновляют в них время и
+результат, поэтому критерий «байт-в-байт» применяется к управляемым файлам
+(юниты, polkit, sysctl, `state.json`, `active.json`, `warp.yaml`, build-stamp,
+`strategies.json`, `dpi-domains.txt`, `/etc/hosts`), а не к этим кэшам.
+
 IPC из шелла:
 
 ```bash
