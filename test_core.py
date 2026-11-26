@@ -1839,6 +1839,31 @@ class CoreHelpersTest(SandboxTest):
         other = self.base / "state.json"
         core.write_json(other, [1, 2])
         self.assertTrue(other.exists())
+        self.assertEqual(other.stat().st_mode & 0o777, 0o644)
+
+    def test_mode_none_preserves_an_existing_file_mode(self):
+        path = self.base / "secret.json"
+        core.write_json(path, {"a": 1}, mode=0o600)
+        core.write_json(path, {"a": 2})
+        self.assertEqual(json.loads(path.read_text(encoding="utf-8")), {"a": 2})
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_failed_replace_keeps_the_old_bytes_and_no_temp_file(self):
+        path = self.base / "state.json"
+        core.write_json(path, {"a": 2})
+        seen = {}
+
+        def replace(src, dst):
+            seen["src"] = pathlib.Path(src)
+            raise OSError("disk full")
+
+        with mock.patch.object(os, "replace", side_effect=replace):
+            with self.assertRaises(OSError):
+                core.write_json(path, {"a": 3})
+        self.assertEqual(json.loads(path.read_text(encoding="utf-8")), {"a": 2})
+        self.assertTrue(seen["src"].name.startswith("." + path.name + "."))
+        self.assertNotEqual(seen["src"].name, "." + path.name + ".tmp")
+        self.assertFalse(seen["src"].exists())
 
     def test_unit_error_and_checked_call_keep_the_old_message_shape(self):
         cp = completed([], 1, "out\n", "err-line\n")
