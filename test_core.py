@@ -18,6 +18,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -77,6 +78,7 @@ class SandboxTest(unittest.TestCase):
             "WARP_ACCOUNT": self.state / "account.json",
             "WARP_WG_ACCOUNT": self.state / "wg-account.json",
             "WARP_BUILD_STAMP": self.state / "warp-build.json",
+            "WARP_PROBE_CACHE": self.state / "warp-probes.json",
         }
         for name, value in paths.items():
             patcher = mock.patch.object(C, name, value)
@@ -737,6 +739,7 @@ class WarpTest(SandboxTest):
 
         reachable = {C.WARP_ENDPOINTS[0]}
         with mock.patch.object(core, "run", side_effect=run), \
+             mock.patch.object(warp_network, "tcp_open", lambda *a, **k: True), \
              mock.patch.object(warp_network, "endpoint_healthy",
                                side_effect=lambda w, host: host in reachable), \
              mock.patch.object(warp_network, "interface_mtu", lambda w, d: 1400):
@@ -804,6 +807,78 @@ class WarpTest(SandboxTest):
         self.assertFalse(data["ipv6"])
         self.assertIn("8.47.69.189/32", data["tun"]["route-exclude-address"])
         self.assertIn("# WARP over WireGuard", text)
+
+    def _profile(self):
+        return {"interface": "eth0", "gateway": "192.168.5.1",
+                "address": "192.168.5.20"}
+
+    def test_cached_endpoint_skips_the_mihomo_probe(self):
+        profile = self._profile()
+        core.write_json(C.WARP_PROBE_CACHE, {
+            "version": 1, "time": int(time.time()),
+            "path": warp_network.path_key(profile),
+            "endpoints": {C.WARP_ENDPOINT: True},
+        })
+        with mock.patch.object(warp_network, "network_signature",
+                               lambda w: dict(profile)), \
+             mock.patch.object(warp_network, "tcp_open",
+                               side_effect=AssertionError("must not probe")), \
+             mock.patch.object(warp_network, "endpoint_healthy",
+                               side_effect=AssertionError("must not probe")):
+            result = warp.warp_network()
+        self.assertEqual(result["endpoint"], C.WARP_ENDPOINT)
+        self.assertEqual(result["endpoints"], [C.WARP_ENDPOINT])
+
+    def test_tcp_failure_skips_the_mihomo_probe(self):
+        with mock.patch.object(warp_network, "network_signature",
+                               lambda w: self._profile()), \
+             mock.patch.object(warp_network, "tcp_open", lambda *a, **k: False), \
+             mock.patch.object(warp_network, "endpoint_healthy",
+                               side_effect=AssertionError("must not probe")):
+            result = warp.warp_network()
+        self.assertEqual(result["endpoints"], [])
+        self.assertEqual(result["endpoint"], C.WARP_ENDPOINT)
+
+    def test_stale_cache_forces_a_fresh_probe(self):
+        profile = self._profile()
+        core.write_json(C.WARP_PROBE_CACHE, {
+            "version": 1, "time": int(time.time()) - 3600,
+            "path": warp_network.path_key(profile),
+            "endpoints": {C.WARP_ENDPOINT: True},
+        })
+        with mock.patch.object(warp_network, "network_signature",
+                               lambda w: dict(profile)), \
+             mock.patch.object(warp_network, "tcp_open", lambda *a, **k: True), \
+             mock.patch.object(warp_network, "endpoint_healthy",
+                               return_value=False) as probe:
+            result = warp.warp_network()
+        self.assertEqual(result["endpoints"], [])
+        self.assertEqual(probe.call_count, 2)
+
+    def test_wg_profile_uses_a_cached_endpoint(self):
+        account = {"private_key": "cHJpdg==", "public_key": "cHVi",
+                   "id": "wg-id", "ipv4": "172.16.0.2"}
+        chosen = C.WARP_WG_ENDPOINTS[1]
+        core.write_json(C.WARP_PROBE_CACHE, {
+            "version": 1, "time": int(time.time()), "path": "wg",
+            "wg": {endpoint: endpoint == chosen
+                   for endpoint in C.WARP_WG_ENDPOINTS},
+        })
+        with mock.patch.object(warp, "wg_account", lambda: account), \
+             mock.patch.object(warp_network, "wg_endpoint_healthy",
+                               side_effect=AssertionError("must not probe")):
+            profile = warp.wg_profile()
+        self.assertEqual(profile["wg_endpoint"], chosen.rsplit(":", 1)[0])
+
+    def test_wg_probe_tries_only_one_backup(self):
+        account = {"private_key": "cHJpdg==", "public_key": "cHVi",
+                   "id": "wg-id", "ipv4": "172.16.0.2"}
+        with mock.patch.object(warp, "wg_account", lambda: account), \
+             mock.patch.object(warp_network, "wg_endpoint_healthy",
+                               return_value=False) as probe:
+            profile = warp.wg_profile()
+        self.assertEqual(profile, {})
+        self.assertEqual(probe.call_count, 2)
 
     def test_wg_profile_picks_the_first_healthy_endpoint(self):
         account = {"private_key": "cHJpdg==", "public_key": "cHVi",

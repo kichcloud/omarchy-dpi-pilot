@@ -8,10 +8,52 @@ from __future__ import annotations
 
 import ipaddress
 import re
+import time
 
 from pathlib import Path
 
 from . import constants as C
+
+PROBE_TTL = 1800
+
+
+def _cache_fresh(cache):
+    path = str((cache or {}).get("path") or "")
+    started = cache.get("time") if isinstance(cache, dict) else 0
+    try:
+        age = time.time() - int(started or 0)
+    except (TypeError, ValueError):
+        return False
+    return bool(path) and 0 <= age <= PROBE_TTL
+
+
+def load_probe_cache(warp):
+    cache = warp.core.read_dict(C.WARP_PROBE_CACHE)
+    return cache if cache.get("version") == 1 else {}
+
+
+def save_probe_cache(warp, cache):
+    cache["version"] = 1
+    warp.core.write_json(C.WARP_PROBE_CACHE, cache, 0o600)
+
+
+def path_key(profile):
+    return "%s|%s|%s" % (profile.get("interface") or "",
+                         profile.get("gateway") or "",
+                         profile.get("address") or "")
+
+
+def tcp_open(host, port=443, timeout=2.0):
+    """Cheap reachability gate before starting a full mihomo handshake."""
+    import socket
+    host = str(host or "").split("#")[0]
+    if not host:
+        return False
+    try:
+        with socket.create_connection((host, int(port)), timeout=timeout):
+            return True
+    except (OSError, ValueError):
+        return False
 
 
 def _run(warp, argv, timeout=5):
@@ -295,25 +337,71 @@ def wg_profile(warp):
     account = warp.wg_account()
     if not account:
         return {}
+    cache = load_probe_cache(warp)
+    fresh = _cache_fresh(cache)
+    known = dict(cache.get("wg") or {})
+    chosen = ""
+    attempts = 0
     for endpoint in warp.C.WARP_WG_ENDPOINTS:
-        if not wg_endpoint_healthy(warp, endpoint, account):
-            continue
-        host, _, port = endpoint.rpartition(":")
-        return {
-            "wg_endpoint": host,
-            "wg_port": int(port),
-            "wg_private_key": account["private_key"],
-            "wg_public_key": account["public_key"],
-            "wg_ipv4": cidr_of(account.get("ipv4"), 4),
-        }
-    return {}
+        if fresh and endpoint in known:
+            ok = bool(known[endpoint])
+        else:
+            ok = wg_endpoint_healthy(warp, endpoint, account)
+            known[endpoint] = ok
+            attempts += 1
+        if ok:
+            chosen = endpoint
+            break
+        # Probing every sibling costs ~3 s each; one backup is enough.
+        if attempts >= 2:
+            break
+    if attempts:
+        cache["time"] = int(time.time())
+        cache["path"] = str(cache.get("path") or "wg")
+        cache["wg"] = known
+        save_probe_cache(warp, cache)
+    if not chosen:
+        return {}
+    host, _, port = chosen.rpartition(":")
+    return {
+        "wg_endpoint": host,
+        "wg_port": int(port),
+        "wg_private_key": account["private_key"],
+        "wg_public_key": account["public_key"],
+        "wg_ipv4": cidr_of(account.get("ipv4"), 4),
+    }
 
 
-def reachable_endpoints(warp):
+def reachable_endpoints(warp, profile=None):
     """Prefer the pinned gateway, but use a proven sibling if it is blocked."""
     ordered = [C.WARP_ENDPOINT] + [ip for ip in C.WARP_ENDPOINTS
                                    if ip != C.WARP_ENDPOINT]
-    return [ip for ip in ordered if endpoint_healthy(warp, ip)]
+    key = path_key(profile or {})
+    cache = load_probe_cache(warp)
+    fresh = _cache_fresh(cache) and (not key or cache.get("path") == key)
+    known = dict(cache.get("endpoints") or {})
+    result = []
+    attempts = 0
+    for ip in ordered:
+        if fresh and ip in known:
+            ok = bool(known[ip])
+        else:
+            ok = tcp_open(ip) and endpoint_healthy(warp, ip)
+            known[ip] = ok
+            attempts += 1
+        if ok:
+            result.append(ip)
+            break
+        # The pinned gateway plus one backup covers a blocked pin without
+        # probing every sibling on every rebuild.
+        if attempts >= 2:
+            break
+    if attempts:
+        cache["time"] = int(time.time())
+        cache["path"] = key or str(cache.get("path") or "")
+        cache["endpoints"] = known
+        save_probe_cache(warp, cache)
+    return result
 
 
 def network_signature(warp):
@@ -341,7 +429,7 @@ def network_signature(warp):
 
 def warp_network(warp, probe=True):
     profile = network_signature(warp)
-    endpoints = reachable_endpoints(warp) if probe else []
+    endpoints = reachable_endpoints(warp, profile) if probe else []
     profile.update({
         "endpoint": endpoints[0] if endpoints else C.WARP_ENDPOINT,
         "endpoints": endpoints,

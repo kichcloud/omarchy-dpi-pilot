@@ -76,6 +76,7 @@ WARP_ACCOUNT = STATE_DIR / "account.json"
 WARP_WG_ACCOUNT = STATE_DIR / "wg-account.json"
 WARP_CHECK_FILE = STATE_DIR / "warp-check.json"
 WARP_BUILD_STAMP = STATE_DIR / "warp-build.json"
+WARP_PROBE_CACHE = STATE_DIR / "warp-probes.json"
 
 REPAIR_DISCORD_DOMAINS = ("discord.com", "discordapp.com", "discordapp.net", "discord.gg")
 REPAIR_MEDIA_DOMAINS = ("media.discordapp.net", "images.discordapp.net")
