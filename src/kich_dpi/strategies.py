@@ -15,44 +15,55 @@ from .dpi_specs import (
 _self = sys.modules[__name__]
 
 
-def http_probe(url, timeout, interface=""):
-    """One request; returns (ok, code, ms, error)."""
+def http_probes(urls, timeout, interface=""):
+    """One curl for many URLs; returns (ok, code, ms, error) per URL."""
     started = time.monotonic()
     args = [
-        "curl", "-sS", "-o", "/dev/null", "--connect-timeout", "4",
+        "curl", "-sS", "--connect-timeout", "4",
         "--max-time", str(timeout), "-A", "Mozilla/5.0 (X11; Linux x86_64)",
-        "-w", "%{http_code} %{time_total}",
+        "-w", "%{http_code} %{time_total}\\n",
     ]
     if interface:
         args += ["--interface", interface, "-4"]
-    args.append(url)
-    cp = core.run(args, timeout=timeout + 3)
-    parts = (cp.stdout or "").strip().split()
-    code = int(parts[0]) if parts and parts[0].isdigit() else 0
-    try:
-        elapsed = float(parts[1]) if len(parts) > 1 else time.monotonic() - started
-    except ValueError:
-        elapsed = time.monotonic() - started
-    ok = cp.returncode == 0 and 200 <= code < 400
-    error = "" if ok else (cp.stderr or "").strip()
-    error = error.splitlines()[-1] if error else ""
-    return ok, code, int(round(elapsed * 1000)), core.clip(error, limit=160, strip=False)
+    for url in urls:
+        args += ["-o", "/dev/null", url]
+    cp = core.run(args, timeout=timeout * max(1, len(urls)) + 3)
+    lines = (cp.stdout or "").splitlines()
+    stderr = (cp.stderr or "").strip()
+    error = stderr.splitlines()[-1] if stderr else ""
+    answers = []
+    for index in range(len(urls)):
+        parts = lines[index].split() if index < len(lines) else []
+        code = int(parts[0]) if parts and parts[0].isdigit() else 0
+        try:
+            elapsed = float(parts[1]) if len(parts) > 1 else None
+        except ValueError:
+            elapsed = None
+        if elapsed is None:
+            elapsed = time.monotonic() - started
+        ok = 200 <= code < 400
+        answers.append((ok, code, int(round(elapsed * 1000)),
+                        "" if ok else core.clip(error, limit=160, strip=False)))
+    return answers
 
 
-def probe_row(key, label, url, timeout, device):
-    ok, code, ms, error = http_probe(url, timeout, device)
-    return {"key": key, "label": label, "ok": ok, "code": code,
-            "ms": ms, "error": error}
+def http_probe(url, timeout, interface=""):
+    """One request; kept for single-URL callers and tests."""
+    return http_probes([url], timeout, interface)[0]
+
+
+def probe_rows(targets, answers):
+    return [{"key": key, "label": label, "ok": ok, "code": code,
+             "ms": ms, "error": error}
+            for (key, label, _url), (ok, code, ms, error) in zip(targets, answers)]
 
 
 def probe(targets=C.TARGETS, timeout=7, direct=False, interface=None):
     if not core.curl_available():
         raise core.Fail("не найден curl")
     device = interface if interface is not None else (core.direct_device() if direct else "")
-    results = []
-    for key, label, url in targets:
-        results.append(probe_row(key, label, url, timeout, device))
-        time.sleep(0.15)
+    results = probe_rows(targets, http_probes([url for _key, _label, url in targets],
+                                              timeout, device))
     passed = sum(1 for row in results if row["ok"])
     latency = sum(row["ms"] for row in results if row["ok"]) if passed else 10 ** 9
     return {
@@ -65,13 +76,16 @@ def sanity(timeout=6, device=None):
     """Reject a strategy that breaks TLS to hosts which are not blocked."""
     if device is None:
         device = core.direct_device()
-    results = []
-    for key, url in SANITY_TARGETS:
-        row = probe_row(key, key, url, timeout, device)
-        if not row["ok"]:
-            time.sleep(0.2)
-            row = probe_row(key, key, url, timeout, device)
-        results.append(row)
+    targets = [(key, key, url) for key, url in SANITY_TARGETS]
+    results = probe_rows(targets, http_probes([url for _key, _label, url in targets],
+                                              timeout, device))
+    retry = [(index, row) for index, row in enumerate(results) if not row["ok"]]
+    if retry:
+        time.sleep(0.2)
+        again = http_probes([targets[index][2] for index, _row in retry],
+                           timeout, device)
+        for (index, _row), answer in zip(retry, again):
+            results[index] = probe_rows([targets[index]], [answer])[0]
     return {"ok": all(row["ok"] for row in results), "device": device,
             "results": results}
 

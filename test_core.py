@@ -1264,32 +1264,60 @@ class ProbeSanityTest(SandboxTest):
     def test_direct_probe_binds_the_physical_interface(self):
         seen = []
 
-        def fake_probe(url, timeout, interface=""):
+        def fake_probes(urls, timeout, interface=""):
             seen.append(interface)
-            return True, 204, 10, ""
+            return [(True, 204, 10, "") for _url in urls]
 
         with mock.patch.object(core, "curl_available", lambda: True), \
              mock.patch.object(core, "direct_device", return_value="enp8s0"), \
-             mock.patch.object(strategies, "http_probe", side_effect=fake_probe), \
-             mock.patch.object(strategies.time, "sleep"):
+             mock.patch.object(strategies, "http_probes", side_effect=fake_probes):
             result = strategies.probe(direct=True)
         self.assertTrue(result["direct"])
         self.assertEqual(set(seen), {"enp8s0"})
 
+    def test_probe_uses_one_curl_for_three_targets(self):
+        stdout = "200 0.100000\n204 0.050000\n200 0.200000\n"
+        with mock.patch.object(core, "curl_available", lambda: True), \
+             mock.patch.object(core, "direct_device", return_value=""), \
+             mock.patch.object(core, "run",
+                               return_value=completed([], 0, stdout, "")) as run:
+            result = strategies.probe()
+        self.assertEqual(run.call_count, 1)
+        argv = run.call_args.args[0]
+        for _key, _label, url in C.TARGETS:
+            self.assertIn(url, argv)
+        self.assertEqual(argv.count("/dev/null"), 3)
+        self.assertEqual((result["passed"], result["total"]), (3, 3))
+
     def test_sanity_fails_when_a_control_host_does_not_answer(self):
-        def fake_probe(url, timeout, interface=""):
-            ok = any(host in url for host in
-                     ("ya.ru", "aur.archlinux.org", "gosuslugi.ru",
-                      "proxyapi.ru", "opencode.ai"))
-            return ok, (200 if ok else 0), 15, "" if ok else "timeout"
+        def fake_probes(urls, timeout, interface=""):
+            answers = []
+            for url in urls:
+                ok = "example.com" not in url
+                answers.append((ok, 200 if ok else 0, 15, "" if ok else "timeout"))
+            return answers
 
         with mock.patch.object(core, "direct_device", return_value="enp8s0"), \
-             mock.patch.object(strategies, "http_probe", side_effect=fake_probe), \
+             mock.patch.object(strategies, "http_probes", side_effect=fake_probes), \
              mock.patch.object(strategies.time, "sleep"):
             result = strategies.sanity()
         self.assertFalse(result["ok"])
         self.assertEqual([row["label"] for row in result["results"] if not row["ok"]],
                          ["example"])
+
+    def test_sanity_uses_one_curl_for_all_controls(self):
+        calls = []
+
+        def fake_probes(urls, timeout, interface=""):
+            calls.append(list(urls))
+            return [(True, 200, 10, "") for _url in urls]
+
+        with mock.patch.object(core, "direct_device", return_value=""), \
+             mock.patch.object(strategies, "http_probes", side_effect=fake_probes):
+            result = strategies.sanity()
+        self.assertTrue(result["ok"])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(calls[0]), len(strategies.SANITY_TARGETS))
 
     def test_sanity_guards_critical_direct_hosts(self):
         urls = [url for _key, url in strategies.SANITY_TARGETS]
@@ -1319,19 +1347,25 @@ class ProbeSanityTest(SandboxTest):
 
     def test_sanity_retries_a_single_failed_probe(self):
         calls = []
+        first = strategies.SANITY_TARGETS[0][1]
 
-        def fake_probe(url, timeout, interface=""):
-            calls.append(url)
-            if len(calls) == 1:
-                return False, 0, 15, "timeout"
-            return True, 200, 10, ""
+        def fake_probes(urls, timeout, interface=""):
+            calls.append(list(urls))
+            answers = []
+            for url in urls:
+                if url == first and len(calls) == 1:
+                    answers.append((False, 0, 15, "timeout"))
+                else:
+                    answers.append((True, 200, 10, ""))
+            return answers
 
         with mock.patch.object(core, "direct_device", return_value=""), \
-             mock.patch.object(strategies, "http_probe", side_effect=fake_probe), \
+             mock.patch.object(strategies, "http_probes", side_effect=fake_probes), \
              mock.patch.object(strategies.time, "sleep"):
             result = strategies.sanity()
         self.assertTrue(result["ok"])
-        self.assertEqual(len(calls), len(strategies.SANITY_TARGETS) + 1)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[1], [first])
 
 
 class AccountMigrationTest(SandboxTest):
