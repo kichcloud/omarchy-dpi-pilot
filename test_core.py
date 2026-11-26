@@ -922,7 +922,7 @@ class WarpTest(SandboxTest):
             return "generated"
 
         with mock.patch.object(warp, "warp_account", lambda: dict(self.ACCOUNT)), \
-             mock.patch.object(warp, "warp_network", lambda: profile), \
+             mock.patch.object(warp, "warp_network", lambda *a, **k: profile), \
              mock.patch.object(warp, "warp_config_text", side_effect=record), \
              mock.patch.object(core, "write_text", side_effect=lambda *a, **k: None):
             warp.warp_build()
@@ -940,12 +940,47 @@ class WarpTest(SandboxTest):
             return "generated"
 
         with mock.patch.object(warp, "warp_account", lambda: dict(self.ACCOUNT)), \
-             mock.patch.object(warp, "warp_network", lambda: profile), \
+             mock.patch.object(warp, "warp_network", lambda *a, **k: profile), \
              mock.patch.object(warp, "wg_profile", lambda: wg), \
              mock.patch.object(warp, "warp_config_text", side_effect=record), \
              mock.patch.object(core, "write_text", side_effect=lambda *a, **k: None):
             warp.warp_build()
         self.assertEqual(seen["network"], dict(profile, **wg))
+
+    def test_build_skips_masque_probes_when_wireguard_is_healthy(self):
+        profile = {"endpoint": C.WARP_ENDPOINT, "networks4": ["10.9.0.0/24"]}
+        wg = {"wg_endpoint": "8.47.69.189", "wg_port": 1701,
+              "wg_private_key": "cHJpdg==", "wg_public_key": "cHVi",
+              "wg_ipv4": "172.16.0.2/32"}
+        seen = {}
+
+        def network(*args, **kwargs):
+            seen["probe"] = kwargs.get("probe", args[0] if args else True)
+            return dict(profile)
+
+        with mock.patch.object(warp, "warp_account", lambda: dict(self.ACCOUNT)), \
+             mock.patch.object(warp, "wg_profile", lambda: wg), \
+             mock.patch.object(warp, "warp_network", side_effect=network), \
+             mock.patch.object(warp, "warp_config_text", lambda a, n: "generated"), \
+             mock.patch.object(core, "write_text", side_effect=lambda *a, **k: None):
+            warp.warp_build()
+        self.assertIs(seen["probe"], False)
+
+    def test_build_keeps_masque_probes_without_wireguard(self):
+        profile = {"endpoint": C.WARP_ENDPOINT, "networks4": ["10.9.0.0/24"]}
+        seen = {}
+
+        def network(*args, **kwargs):
+            seen["probe"] = kwargs.get("probe", args[0] if args else True)
+            return dict(profile)
+
+        with mock.patch.object(warp, "warp_account", lambda: dict(self.ACCOUNT)), \
+             mock.patch.object(warp, "wg_profile", lambda: {}), \
+             mock.patch.object(warp, "warp_network", side_effect=network), \
+             mock.patch.object(warp, "warp_config_text", lambda a, n: "generated"), \
+             mock.patch.object(core, "write_text", side_effect=lambda *a, **k: None):
+            warp.warp_build()
+        self.assertIs(seen["probe"], True)
 
     def test_config_is_reused_when_the_stamp_still_matches(self):
         account = dict(self.ACCOUNT)
@@ -1001,7 +1036,7 @@ class WarpTest(SandboxTest):
             }, 0o600)
             C.WARP_USER_DOMAINS.write_text("example.org\n", encoding="utf-8")
             with mock.patch.object(warp, "warp_network",
-                                   lambda: {"endpoint": C.WARP_ENDPOINT}), \
+                                   lambda *a, **k: {"endpoint": C.WARP_ENDPOINT}), \
                  mock.patch.object(warp, "wg_profile", lambda: {}), \
                  mock.patch.object(warp, "warp_config_text",
                                    lambda a, n: "rebuilt\n"), \
@@ -1016,7 +1051,7 @@ class WarpTest(SandboxTest):
         core.write_json(C.WARP_ACCOUNT, account, 0o600)
         core.write_json(C.WARP_WG_ACCOUNT, {}, 0o600)
         profile = {"endpoint": C.WARP_ENDPOINT}
-        with mock.patch.object(warp, "warp_network", lambda: profile), \
+        with mock.patch.object(warp, "warp_network", lambda *a, **k: profile), \
              mock.patch.object(warp, "wg_profile", lambda: {}), \
              mock.patch.object(warp, "warp_config_text", lambda a, n: "rebuilt\n"), \
              mock.patch.object(core, "out", lambda payload: None):

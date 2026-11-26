@@ -130,8 +130,12 @@ def warp_build(warp, account=None, force=False):
             return warp.C.WARP_CONFIG
     warp.ensure_user_lists()
     warp.install_rule_lists()
-    network = warp.warp_network()
+    # WireGuard is the preferred transport: when it is healthy, MASQUE
+    # gateway probes (mihomo + 1.5 s handshake each) change nothing in the
+    # generated config, so skip them. Without WireGuard they decide the
+    # MASQUE fallback endpoint.
     wg = warp.wg_profile()
+    network = warp.warp_network(probe=not wg)
     if wg:
         network.update(wg)
     text = warp.warp_config_text(account, network)
