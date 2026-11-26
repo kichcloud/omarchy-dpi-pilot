@@ -274,12 +274,38 @@ def extract_engine(archive, tag):
         shutil.copytree(fake_src, stage / "files" / "fake")
 
     target = C.ENGINE_DIR / tag
-    shutil.rmtree(target, ignore_errors=True)
-    stage.rename(target)
+    backup = C.ENGINE_DIR / (".%s.old" % tag)
+    shutil.rmtree(backup, ignore_errors=True)
+    moved_old = False
+    if target.exists() or target.is_symlink():
+        target.rename(backup)
+        moved_old = True
+    try:
+        stage.rename(target)
+    except BaseException:
+        if moved_old:
+            backup.rename(target)
+        raise
     current = C.ENGINE_DIR / "current"
-    if current.is_symlink() or current.exists():
-        current.unlink()
-    current.symlink_to(tag)
+    link = C.ENGINE_DIR / ".current.tmp"
+    try:
+        link.unlink()
+    except OSError:
+        pass
+    try:
+        link.symlink_to(tag)
+        os.replace(link, current)
+    except BaseException:
+        try:
+            link.unlink()
+        except OSError:
+            pass
+        if moved_old:
+            shutil.rmtree(target, ignore_errors=True)
+            backup.rename(target)
+        raise
+    if moved_old:
+        shutil.rmtree(backup, ignore_errors=True)
     return target
 
 

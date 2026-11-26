@@ -235,6 +235,45 @@ class EngineExtractTest(SandboxTest):
         self.assertEqual(os.readlink(C.ENGINE_DIR / "current"), "v9.9.9")
         self.assertTrue(os.access(target / "nfqws2", os.X_OK))
 
+    def test_failed_rename_restores_the_previous_engine(self):
+        archive = self.base / "zapret2-v9.9.9.tar.gz"
+        self._archive(archive)
+        target, current = self._installed()
+        real = pathlib.Path.rename
+
+        def rename(self, dst):
+            if self.name == ".v9.9.9.new":
+                raise OSError("rename failed")
+            return real(self, dst)
+
+        with mock.patch.object(core, "machine_arch", lambda: "x86_64"), \
+             mock.patch.object(pathlib.Path, "rename", rename):
+            with self.assertRaises(OSError):
+                engine.extract_engine(archive, "v9.9.9")
+        self.assertEqual((target / "nfqws2").read_bytes(), b"old")
+        self.assertEqual(os.readlink(current), "v9.9.9")
+
+    def test_failed_symlink_swap_restores_the_previous_engine(self):
+        archive = self.base / "zapret2-v9.9.9.tar.gz"
+        self._archive(archive)
+        target, current = self._installed()
+        with mock.patch.object(core, "machine_arch", lambda: "x86_64"), \
+             mock.patch.object(os, "replace", side_effect=OSError("swap failed")):
+            with self.assertRaises(OSError):
+                engine.extract_engine(archive, "v9.9.9")
+        self.assertEqual((target / "nfqws2").read_bytes(), b"old")
+        self.assertEqual(os.readlink(current), "v9.9.9")
+        self.assertFalse((C.ENGINE_DIR / ".v9.9.9.old").exists())
+
+    def _installed(self, tag="v9.9.9"):
+        C.ENGINE_DIR.mkdir(parents=True, exist_ok=True)
+        target = C.ENGINE_DIR / tag
+        target.mkdir(parents=True)
+        (target / "nfqws2").write_bytes(b"old")
+        current = C.ENGINE_DIR / "current"
+        current.symlink_to(tag)
+        return target, current
+
     def test_rejects_archive_without_binary(self):
         archive = self.base / "bad.tar.gz"
         self._archive(archive, with_binary=False)
