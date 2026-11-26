@@ -20,10 +20,10 @@ Panel {
   // ---- DPI Pilot drawer -------------------------------------------------
   // The popup content is loaded lazily by KeyboardPanel, so the drawer cannot
   // be referenced by id from the Panel root. It publishes itself through
-  // drawerReady/drawerGone instead, like it did before the rewrite.
+  // drawerReady/drawerGone instead: the drawer owns its own lifecycle.
   property bool dpiExpanded: false
   property var dpiDrawerItem: null
-  property string dpiPending: ""
+  property var dpiPending: []
   readonly property bool dpiUnhealthy: dpiDrawerItem ? dpiDrawerItem.unhealthy : false
 
   function dpiRun(d, name) {
@@ -35,7 +35,7 @@ Panel {
     root.dpiExpanded = true
     root.open()
     if (dpiDrawerItem) dpiRun(dpiDrawerItem, name)
-    else root.dpiPending = name
+    else root.dpiPending.push(name)
   }
 
   // Centralized close so callers can't forget to drop the passphrase prompt.
@@ -166,7 +166,6 @@ Panel {
   property string focusSection: "dns"  // "header" | "portal" | "band" | "dns" | "wifi"
   property int headerIndex: 0
   readonly property bool canDisconnect: !!connectedWifiNetwork
-  readonly property bool headerHasDisconnect: false
   readonly property bool canShareWifi: info.type === "wifi" && canShareNetwork(connectedWifiNetwork)
   // The hero switch is the Wi-Fi radio, so it only exists when there is a
   // radio to switch. On a wired box it would otherwise sit there reading
@@ -358,8 +357,8 @@ Panel {
   // Single cursor model: exactly one highlighted spot across the whole
   // panel, located via `focusSection` + (`headerIndex` | `dnsIndex` |
   // `selectedIndex`). Mouse hover and keyboard nav both mutate this state
-  // at the root; items never read containsMouse for visuals. See
-  // CursorSurface for the shared chrome shared by rows and pills.
+  // at the root; items never read containsMouse for visuals. CursorSurface
+  // supplies the shared chrome for rows, while pills use stock buttons.
   readonly property color hoverFill: bar ? Style.hoverFillFor(bar.foreground, Commons.Color.accent) : "transparent"
   readonly property color selectedFill: bar ? Style.selectedFillFor(bar.foreground, Commons.Color.accent) : "transparent"
 
@@ -1819,12 +1818,14 @@ Panel {
 
         onDrawerReady: function(d) {
           root.dpiDrawerItem = d
-          if (root.dpiPending !== "") {
-            root.dpiRun(d, root.dpiPending)
-            root.dpiPending = ""
-          }
+          var pending = root.dpiPending
+          root.dpiPending = []
+          for (var i = 0; i < pending.length; i++) root.dpiRun(d, pending[i])
         }
-        onDrawerGone: root.dpiDrawerItem = null
+        onDrawerGone: {
+          root.dpiDrawerItem = null
+          root.dpiPending = []
+        }
       }
     }
     }
@@ -1863,9 +1864,8 @@ Panel {
     }
   }
 
-  // One DNS provider pill. The cursor + current visuals come entirely from
-  // CursorSurface; this component just binds them to the panel's cursor
-  // state and renders the label/tooltip/click target.
+  // One DNS provider pill. It uses the stock button kit and binds the
+  // panel's cursor state to the label, tooltip and click target.
   component DnsProviderPill: Button {
     id: pill
     required property string provider
@@ -2185,8 +2185,7 @@ Panel {
         anchors.bottom: parent.bottom
         anchors.bottomMargin: Style.spacing.rowGap / 2
         anchors.rightMargin: Style.space(6)
-        password: true
-        revealed: passwordPanel.revealed
+        password: !passwordPanel.revealed
         placeholderText: Commons.I18n.t("network.passphrase")
         font.family: Style.font.family
         font.pixelSize: Style.font.body

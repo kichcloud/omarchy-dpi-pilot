@@ -4,6 +4,7 @@ Every test imports the package from ``src/`` instead of loading the root
 launcher. All paths the code can touch (HOME, /opt, /etc, systemd units) are
 patched to a temporary tree, so a test run never changes the machine.
 """
+import hashlib
 import io
 import ipaddress
 import json
@@ -27,7 +28,8 @@ BIN = ROOT / "kich-dpi"
 sys.path.insert(0, str(ROOT / "src"))
 
 from kich_dpi import constants as C  # noqa: E402
-from kich_dpi import cli, core, engine, repair, status, strategies, warp  # noqa: E402
+from kich_dpi import (cli, core, engine, ownership, repair, status,  # noqa: E402
+                      strategies, warp, warp_network)
 
 
 def completed(argv, rc=0, out="", err=""):
@@ -72,6 +74,8 @@ class SandboxTest(unittest.TestCase):
             "PROGRESS_FILE": self.state / "progress.json",
             "WARP_CHECK_FILE": self.state / "warp-check.json",
             "WARP_ACCOUNT": self.state / "account.json",
+            "WARP_WG_ACCOUNT": self.state / "wg-account.json",
+            "WARP_BUILD_STAMP": self.state / "warp-build.json",
         }
         for name, value in paths.items():
             patcher = mock.patch.object(C, name, value)
@@ -131,9 +135,10 @@ class CandidatesTest(SandboxTest):
     def test_empty_domain_list_keeps_global_bypass(self):
         C.DPI_DOMAINS_FILE.write_text("# no selective hosts\n", encoding="utf-8")
         text = strategies.render_config(strategies.candidates()[0])
-        self.assertNotIn("--hostlist-domains", text)
+        self.assertNotIn("--hostlist-domains=discord.com", text)
+        self.assertIn("--hostlist-domains=discord.media", text)
 
-    def test_config_has_three_profiles(self):
+    def test_config_has_six_profiles(self):
         for row in strategies.candidates():
             text = strategies.render_config(row)
             self.assertIn("--qnum=%d" % C.QUEUE, text)
@@ -141,9 +146,19 @@ class CandidatesTest(SandboxTest):
             self.assertIn("--filter-tcp=80", text)
             self.assertIn("--filter-tcp=443", text)
             self.assertIn("--filter-udp=443", text)
-            self.assertEqual(text.count("--new"), 2)
+            self.assertEqual(text.count("--new"), 5)
             self.assertIn("zapret-antidpi.lua", text)
             self.assertNotIn("--dry-run", text)
+
+    def test_config_covers_discord_voice(self):
+        text = strategies.render_config(strategies.candidates()[0])
+        self.assertIn("--filter-udp=19294-19344,50000-50100", text)
+        self.assertIn("--filter-l7=discord\n--payload=discord_ip_discovery", text)
+        self.assertIn("--filter-l7=stun\n--payload=stun", text)
+        self.assertEqual(text.count("--lua-desync=fake:blob=quic_google:repeats=6"), 3)
+        self.assertIn("--filter-tcp=2053,2083,2087,2096,8443", text)
+        self.assertIn("--hostlist-domains=discord.media\n--payload=tls_client_hello", text)
+        self.assertIn("--lua-desync=multisplit:seqovl=681:pos=1:seqovl_pattern=tls_google", text)
 
     def test_fake_and_split_only_variants(self):
         rows = {row["action"]: row for row in strategies.candidates()}
@@ -235,6 +250,8 @@ class EngineExtractTest(SandboxTest):
         self.assertIn("ip daddr @warp_ep return", script)
         self.assertIn("ip saddr @warp_ep return", script)
         self.assertNotIn(C.WARP_MARK, script)
+        self.assertIn("tcp dport { 2053, 2083, 2087, 2096, 8443 }", script)
+        self.assertIn("udp dport { 19294-19344, 50000-50100 }", script)
 
     def test_fw_rule_keeps_stamped_packets_off_the_tunnel(self):
         calls = []
@@ -315,9 +332,54 @@ class InstallTest(SandboxTest):
         self.assertIn(["systemctl", "enable", C.UNIT], calls)
         self.assertIn(["systemctl", "enable", C.WARP_UNIT], calls)
 
+    def test_second_setup_is_a_noop_when_nothing_changed(self):
+        calls = []
+        state = {"sysctl": ""}
+        user = SimpleNamespace(pw_name="u", pw_dir=str(self.home),
+                               pw_uid=1000, pw_gid=1000)
+
+        def run(argv, **kwargs):
+            argv = [str(a) for a in argv]
+            calls.append(argv)
+            if argv[:2] == ["systemctl", "is-enabled"]:
+                return completed(argv, 0, "enabled\n", "")
+            if argv[:2] == ["sysctl", "-n"]:
+                return completed(argv, 0, state["sysctl"], "")
+            if argv[:3] == ["sysctl", "-q", "-w"]:
+                state["sysctl"] = "1"
+            return completed(argv)
+
+        def write_text(path, text, mode=0o644):
+            path = pathlib.Path(path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text, encoding="utf-8")
+            path.chmod(mode)
+
+        patches = (
+            mock.patch.object(engine.grp, "getgrgid",
+                              lambda gid: SimpleNamespace(gr_name="users")),
+            mock.patch.object(engine, "merge_config_into_state",
+                              lambda home, uid, gid: self.state),
+            mock.patch.object(engine.shutil, "rmtree", lambda *a, **k: None),
+            mock.patch.object(warp, "migrate_account", lambda *a, **k: None),
+            mock.patch.object(core, "write_text", side_effect=write_text),
+            mock.patch.object(core, "run", side_effect=run),
+        )
+        for patcher in patches:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        engine.install_system(user)
+        calls.clear()
+        engine.install_system(user)
+        self.assertNotIn(["systemctl", "daemon-reload"], calls)
+        self.assertNotIn(["systemctl", "enable", C.UNIT], calls)
+        self.assertNotIn(["systemctl", "enable", C.WARP_UNIT], calls)
+        self.assertNotIn(["sysctl", "-q", "-w",
+                          "net.netfilter.nf_conntrack_tcp_be_liberal=1"], calls)
+
     def test_setup_migrates_old_choice_into_state(self):
         self._install({C.UNIT: False, C.WARP_UNIT: True})
-        data = json.loads(C.STATE_FILE.read_text(encoding="utf-8"))
+        data = json.loads((self.state / "state.json").read_text(encoding="utf-8"))
         self.assertFalse(data["dpi"])
         self.assertTrue(data["warp"])
 
@@ -339,6 +401,28 @@ class InstallTest(SandboxTest):
              mock.patch.object(warp, "warp_unit_state", lambda: ("inactive", "")):
             engine.restart_services(False)
         self.assertEqual(calls, [])
+
+    def test_restart_services_skips_when_unchanged(self):
+        with mock.patch.object(core, "systemctl") as dpi_call, \
+             mock.patch.object(warp, "warp_systemctl") as warp_call, \
+             mock.patch.object(warp, "warp_unit_state",
+                               return_value=("active", "enabled")):
+            engine.restart_services(True, changed=False)
+        dpi_call.assert_not_called()
+        warp_call.assert_not_called()
+
+    def test_finish_update_skips_refresh_when_unchanged(self):
+        user = SimpleNamespace(pw_name="kich", pw_dir=str(self.home))
+        with mock.patch.object(engine.installer, "refresh_warp_config",
+                               side_effect=self.fail) as refresh, \
+             mock.patch.object(core, "systemctl") as dpi_call, \
+             mock.patch.object(warp, "warp_systemctl") as warp_call, \
+             mock.patch.object(warp, "warp_unit_state",
+                               return_value=("active", "enabled")):
+            self.assertEqual(engine.finish_system_update(user, True, False), "")
+        refresh.assert_not_called()
+        dpi_call.assert_not_called()
+        warp_call.assert_not_called()
 
     def test_refresh_does_nothing_when_warp_is_not_in_use(self):
         with mock.patch.object(core, "run",
@@ -515,6 +599,257 @@ class WarpTest(SandboxTest):
         with self.assertRaises(core.Fail):
             warp.warp_config_text(self.ACCOUNT)
 
+    def test_network_profile_describes_the_real_link(self):
+        def run(argv, **kwargs):
+            args = [str(a) for a in argv]
+            if args[:4] == ["ip", "-4", "route", "show"] and "default" in args:
+                return completed(args, 0, "default via 192.168.5.1 dev eth9 "
+                                 "proto dhcp src 192.168.5.20 metric 100\n")
+            if args[:3] == ["ip", "-4", "addr", "show"]:
+                return completed(args, 0, "2: eth9: inet 192.168.5.20/24 brd "
+                                 "192.168.5.255 scope global eth9\n")
+            if "-4" in args and "link" in args:
+                return completed(args, 0, "192.168.5.0/24 proto kernel scope "
+                                 "link src 192.168.5.20\n")
+            if "-6" in args:
+                return completed(args, 0, "")
+            if args and args[0] == "resolvectl":
+                return completed(args, 0, "Global: 9.9.9.9\neth9: 192.168.5.1\n")
+            return completed(args, 1, "", "unexpected command")
+
+        reachable = {C.WARP_ENDPOINTS[0]}
+        with mock.patch.object(core, "run", side_effect=run), \
+             mock.patch.object(warp_network, "endpoint_healthy",
+                               side_effect=lambda w, host: host in reachable), \
+             mock.patch.object(warp_network, "interface_mtu", lambda w, d: 1400):
+            profile = warp.warp_network()
+        self.assertEqual(profile["interface"], "eth9")
+        self.assertEqual(profile["gateway"], "192.168.5.1")
+        self.assertEqual(profile["address"], "192.168.5.20")
+        self.assertEqual(profile["networks4"], ["192.168.5.0/24"])
+        self.assertEqual(profile["mtu"], 1400)
+        self.assertEqual(profile["dns"], ["9.9.9.9", "192.168.5.1"])
+        self.assertFalse(profile["ipv6"])
+        # The pinned gateway is blocked here, so a sibling must be selected.
+        self.assertEqual(profile["endpoint"], C.WARP_ENDPOINTS[0])
+        self.assertEqual(profile["endpoints"], [C.WARP_ENDPOINTS[0]])
+
+    def test_config_follows_the_detected_network(self):
+        try:
+            import yaml
+        except ImportError:
+            self.skipTest("pyyaml is not installed")
+        profile = {
+            "interface": "eth9", "gateway": "192.168.5.1", "address": "192.168.5.20",
+            "networks4": ["192.168.5.0/24"], "networks6": [], "mtu": 1200,
+            "ipv6": False, "dns": ["9.9.9.9", "192.168.5.1"],
+            "endpoint": "162.159.198.2", "endpoints": ["162.159.198.2"],
+        }
+        text = warp.warp_config_text(self.ACCOUNT, profile)
+        data = yaml.safe_load(text)
+        proxy = data["proxies"][0]
+        self.assertEqual(proxy["server"], "162.159.198.2")
+        self.assertEqual(proxy["ip-version"], "ipv4-only")
+        self.assertNotIn("ipv6", proxy)
+        self.assertEqual(data["tun"]["mtu"], 1200)
+        self.assertNotIn("inet6-address", data["tun"])
+        self.assertFalse(data["dns"]["ipv6"])
+        self.assertIn("192.168.5.0/24", data["tun"]["route-exclude-address"])
+        self.assertNotIn("192.168.0.0/16", data["tun"]["route-exclude-address"])
+        self.assertIn("IP-CIDR,192.168.5.0/24,DIRECT,no-resolve", data["rules"])
+        self.assertNotIn("IP-CIDR,192.168.0.0/16,DIRECT,no-resolve", data["rules"])
+        self.assertEqual(data["dns"]["default-nameserver"], ["9.9.9.9", "192.168.5.1"])
+        self.assertEqual(data["dns"]["nameserver"], ["https://9.9.9.9/dns-query"])
+        self.assertIn("Network: eth9 via 192.168.5.1", text)
+
+    def test_wireguard_profile_avoids_the_dme_node(self):
+        try:
+            import yaml
+        except ImportError:
+            self.skipTest("pyyaml is not installed")
+        profile = {
+            "interface": "eth9", "gateway": "192.168.5.1", "address": "192.168.5.20",
+            "networks4": ["192.168.5.0/24"], "networks6": [], "mtu": 1280,
+            "ipv6": True, "dns": ["9.9.9.9"], "endpoint": C.WARP_ENDPOINT,
+            "endpoints": [C.WARP_ENDPOINT],
+            "wg_endpoint": "8.47.69.189", "wg_port": 1701,
+            "wg_private_key": "cHJpdg==", "wg_public_key": "cHVi",
+            "wg_ipv4": "172.16.0.2/32",
+        }
+        text = warp.warp_config_text(self.ACCOUNT, profile)
+        data = yaml.safe_load(text)
+        proxy = data["proxies"][0]
+        self.assertEqual(proxy["type"], "wireguard")
+        self.assertEqual(proxy["peers"][0]["server"], "8.47.69.189")
+        self.assertEqual(proxy["peers"][0]["port"], 1701)
+        self.assertNotIn("network", proxy)
+        self.assertFalse(data["ipv6"])
+        self.assertIn("8.47.69.189/32", data["tun"]["route-exclude-address"])
+        self.assertIn("# WARP over WireGuard", text)
+
+    def test_wg_profile_picks_the_first_healthy_endpoint(self):
+        account = {"private_key": "cHJpdg==", "public_key": "cHVi",
+                   "id": "wg-id", "access_token": "token", "ipv4": "172.16.0.2"}
+        chosen = C.WARP_WG_ENDPOINTS[1]
+
+        def healthy(_warp, endpoint, _account):
+            return endpoint == chosen
+
+        with mock.patch.object(warp, "wg_account", lambda: account), \
+             mock.patch.object(warp_network, "wg_endpoint_healthy", healthy):
+            profile = warp.wg_profile()
+        self.assertEqual(profile["wg_endpoint"], chosen.rsplit(":", 1)[0])
+        self.assertEqual(profile["wg_port"], int(chosen.rsplit(":", 1)[1]))
+        self.assertEqual(profile["wg_ipv4"], "172.16.0.2/32")
+
+    def test_wg_registration_saves_the_device(self):
+        reg = {
+            "id": "wg-id", "token": "wg-token",
+            "config": {
+                "peers": [{"public_key": "peer-key"}],
+                "interface": {"addresses": {"v4": "172.16.0.2", "v6": "fd00::2"}},
+            },
+        }
+        saved = {}
+
+        with mock.patch.object(warp, "cf_request", lambda *a, **k: reg), \
+             mock.patch.object(warp, "save_wg_account", lambda a: saved.update(a)):
+            account = warp.warp_register_wg()
+        self.assertEqual(saved, account)
+        self.assertEqual(account["public_key"], "peer-key")
+        self.assertEqual(account["ipv4"], "172.16.0.2")
+        self.assertEqual(account["access_token"], "wg-token")
+
+    def test_build_passes_the_profile_to_the_generator(self):
+        profile = {"endpoint": "162.159.198.2", "networks4": ["10.9.0.0/24"]}
+        seen = {}
+
+        def record(account, network):
+            seen["network"] = network
+            return "generated"
+
+        with mock.patch.object(warp, "warp_account", lambda: dict(self.ACCOUNT)), \
+             mock.patch.object(warp, "warp_network", lambda: profile), \
+             mock.patch.object(warp, "warp_config_text", side_effect=record), \
+             mock.patch.object(core, "write_text", side_effect=lambda *a, **k: None):
+            warp.warp_build()
+        self.assertEqual(seen["network"], profile)
+
+    def test_build_merges_the_wireguard_profile(self):
+        profile = {"endpoint": C.WARP_ENDPOINT, "networks4": ["10.9.0.0/24"]}
+        wg = {"wg_endpoint": "8.47.69.189", "wg_port": 1701,
+              "wg_private_key": "cHJpdg==", "wg_public_key": "cHVi",
+              "wg_ipv4": "172.16.0.2/32"}
+        seen = {}
+
+        def record(account, network):
+            seen["network"] = network
+            return "generated"
+
+        with mock.patch.object(warp, "warp_account", lambda: dict(self.ACCOUNT)), \
+             mock.patch.object(warp, "warp_network", lambda: profile), \
+             mock.patch.object(warp, "wg_profile", lambda: wg), \
+             mock.patch.object(warp, "warp_config_text", side_effect=record), \
+             mock.patch.object(core, "write_text", side_effect=lambda *a, **k: None):
+            warp.warp_build()
+        self.assertEqual(seen["network"], dict(profile, **wg))
+
+    def test_config_is_reused_when_the_stamp_still_matches(self):
+        account = dict(self.ACCOUNT)
+        core.write_json(C.WARP_ACCOUNT, account, 0o600)
+        core.write_json(C.WARP_WG_ACCOUNT, {}, 0o600)
+        text = "# generated\n"
+        C.WARP_CONFIG.write_text(text, encoding="utf-8")
+        C.WARP_RULES.mkdir(parents=True, exist_ok=True)
+        for name in ("ru-domain.txt", "ru-ip.txt", "direct-domains.txt"):
+            (C.WARP_RULES / name).write_text("", encoding="utf-8")
+        signature = {"interface": "eth9", "gateway": "192.168.5.1",
+                     "address": "192.168.5.20", "networks4": ["192.168.5.0/24"],
+                     "networks6": [], "mtu": 1400, "ipv6": False, "dns": ["9.9.9.9"]}
+        for path in (C.WARP_USER_DOMAINS, C.WARP_USER_PROCESSES):
+            path.write_text("", encoding="utf-8")
+
+        def unexpected(*args, **kwargs):
+            self.fail("unchanged config must not be regenerated")
+
+        with mock.patch.object(warp, "warp_network_signature", lambda: signature):
+            inputs = warp.warp_build_inputs()
+            core.write_json(C.WARP_BUILD_STAMP, {
+                "version": 1, "account": account["id"], "wg_account": "",
+                "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                "inputs": inputs,
+            }, 0o600)
+            with mock.patch.object(warp, "warp_network", side_effect=unexpected), \
+                 mock.patch.object(warp, "wg_profile", side_effect=unexpected), \
+                 mock.patch.object(warp, "warp_config_text", side_effect=unexpected), \
+                 mock.patch.object(core, "out", lambda payload: None):
+                warp.cmd_warp_config()
+        self.assertEqual(C.WARP_CONFIG.read_text(encoding="utf-8"), text)
+
+    def test_changed_user_list_forces_a_config_rebuild(self):
+        account = dict(self.ACCOUNT)
+        core.write_json(C.WARP_ACCOUNT, account, 0o600)
+        core.write_json(C.WARP_WG_ACCOUNT, {}, 0o600)
+        text = "# generated\n"
+        C.WARP_CONFIG.write_text(text, encoding="utf-8")
+        C.WARP_RULES.mkdir(parents=True, exist_ok=True)
+        for name in ("ru-domain.txt", "ru-ip.txt", "direct-domains.txt"):
+            (C.WARP_RULES / name).write_text("", encoding="utf-8")
+        C.WARP_USER_PROCESSES.write_text("", encoding="utf-8")
+        C.WARP_USER_DOMAINS.write_text("", encoding="utf-8")
+        signature = {"interface": "eth9"}
+
+        with mock.patch.object(warp, "warp_network_signature", lambda: signature):
+            inputs = warp.warp_build_inputs()
+            core.write_json(C.WARP_BUILD_STAMP, {
+                "version": 1, "account": account["id"], "wg_account": "",
+                "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                "inputs": inputs,
+            }, 0o600)
+            C.WARP_USER_DOMAINS.write_text("example.org\n", encoding="utf-8")
+            with mock.patch.object(warp, "warp_network",
+                                   lambda: {"endpoint": C.WARP_ENDPOINT}), \
+                 mock.patch.object(warp, "wg_profile", lambda: {}), \
+                 mock.patch.object(warp, "warp_config_text",
+                                   lambda a, n: "rebuilt\n"), \
+                 mock.patch.object(core, "out", lambda payload: None):
+                warp.cmd_warp_config()
+            built = core.read_dict(C.WARP_BUILD_STAMP)
+        self.assertEqual(C.WARP_CONFIG.read_text(encoding="utf-8"), "rebuilt\n")
+        self.assertNotEqual(built.get("inputs"), inputs)
+
+    def test_forced_config_rebuilds_even_with_a_matching_stamp(self):
+        account = dict(self.ACCOUNT)
+        core.write_json(C.WARP_ACCOUNT, account, 0o600)
+        core.write_json(C.WARP_WG_ACCOUNT, {}, 0o600)
+        profile = {"endpoint": C.WARP_ENDPOINT}
+        with mock.patch.object(warp, "warp_network", lambda: profile), \
+             mock.patch.object(warp, "wg_profile", lambda: {}), \
+             mock.patch.object(warp, "warp_config_text", lambda a, n: "rebuilt\n"), \
+             mock.patch.object(core, "out", lambda payload: None):
+            warp.cmd_warp_config(force=True)
+        self.assertEqual(C.WARP_CONFIG.read_text(encoding="utf-8"), "rebuilt\n")
+
+    def test_register_is_a_noop_when_both_accounts_exist(self):
+        core.write_json(C.WARP_ACCOUNT, dict(self.ACCOUNT), 0o600)
+        core.write_json(C.WARP_WG_ACCOUNT, {
+            "id": "wg-id", "private_key": "cHJpdg==", "public_key": "cHVi",
+            "access_token": "token", "ipv4": "172.16.0.2",
+        }, 0o600)
+        built = []
+
+        def unexpected(*args, **kwargs):
+            self.fail("existing accounts must not be re-registered")
+
+        with mock.patch.object(warp, "warp_enroll", side_effect=unexpected), \
+             mock.patch.object(warp, "warp_register", side_effect=unexpected), \
+             mock.patch.object(warp, "warp_register_wg", side_effect=unexpected), \
+             mock.patch.object(warp, "warp_build",
+                               lambda account, force=False: built.append(force)), \
+             mock.patch.object(core, "out", lambda payload: None):
+            warp.cmd_warp_register()
+        self.assertEqual(built, [False])
+
     def test_rule_lists_ship_with_the_plugin(self):
         domains = core.list_lines(ROOT / "ru-domain.txt")
         ips = core.list_lines(ROOT / "ru-ip.txt")
@@ -646,45 +981,119 @@ class WarpTest(SandboxTest):
 
 
 class WarpEnablementTest(SandboxTest):
-    def test_warp_off_stops_and_remembers(self):
+    def _recorder(self, active):
         calls = []
+        state = {"active": active}
 
         def fake(*args, **kwargs):
+            action = args[0]
             calls.append(args)
+            if action == "start":
+                state["active"] = True
+            if action == "stop":
+                state["active"] = False
             return completed(args)
 
+        def unit_state():
+            return ("active" if state["active"] else "inactive", "enabled")
+
+        return calls, fake, unit_state
+
+    def test_warp_off_stops_and_remembers(self):
+        calls, fake, unit_state = self._recorder(True)
+
         with mock.patch.object(warp, "warp_systemctl", fake), \
+             mock.patch.object(warp, "warp_unit_state", unit_state), \
              mock.patch.object(warp, "warp_status", lambda: {}), \
              mock.patch.object(core, "out", lambda payload: None):
             warp.cmd_warp_off()
-        self.assertEqual(calls, [("stop",)])
+        self.assertEqual([c[0] for c in calls], ["stop"])
         self.assertFalse(core.wanted_flags()["warp"])
 
     def test_warp_on_restarts_and_remembers(self):
-        calls = []
-
-        def fake(*args, **kwargs):
-            calls.append(args)
-            return completed(args)
+        calls, fake, unit_state = self._recorder(True)
 
         with mock.patch.object(warp, "warp_available", lambda: True), \
              mock.patch.object(warp, "warp_account", lambda: {"id": "test"}), \
              mock.patch.object(warp, "warp_build", lambda account: None), \
+             mock.patch.object(warp, "warp_check_data", lambda: {"ok": False}), \
+             mock.patch.object(warp, "warp_unit_state", unit_state), \
              mock.patch.object(warp, "warp_systemctl", fake), \
              mock.patch.object(warp, "warp_status", lambda: {}), \
              mock.patch.object(core, "out", lambda payload: None):
             warp.cmd_warp_on()
-        self.assertEqual(calls, [("restart",)])
+        self.assertEqual([c[0] for c in calls], ["restart"])
         self.assertTrue(core.wanted_flags()["warp"])
+
+    def test_repeated_warp_on_leaves_a_healthy_tunnel_alone(self):
+        calls, fake, unit_state = self._recorder(True)
+        C.WARP_CONFIG.write_text("mixed-port: 17890\n", encoding="utf-8")
+        stamp = {"version": 1, "account": "test"}
+
+        with mock.patch.object(warp, "warp_available", lambda: True), \
+             mock.patch.object(warp, "warp_account", lambda: {"id": "test"}), \
+             mock.patch.object(warp, "warp_build", lambda account: None), \
+             mock.patch.object(warp, "warp_build_stamp",
+                               side_effect=[stamp, stamp]), \
+             mock.patch.object(warp, "warp_check_data", lambda: {"ok": True}), \
+             mock.patch.object(warp, "warp_unit_state", unit_state), \
+             mock.patch.object(warp, "warp_systemctl", fake), \
+             mock.patch.object(warp, "warp_status", lambda: {}), \
+             mock.patch.object(core, "out", lambda payload: None):
+            warp.cmd_warp_on()
+        self.assertEqual(calls, [])
+
+    def test_warp_on_restarts_an_unhealthy_tunnel_with_the_same_config(self):
+        calls, fake, unit_state = self._recorder(True)
+        C.WARP_CONFIG.write_text("mixed-port: 17890\n", encoding="utf-8")
+        stamp = {"version": 1, "account": "test"}
+
+        with mock.patch.object(warp, "warp_available", lambda: True), \
+             mock.patch.object(warp, "warp_account", lambda: {"id": "test"}), \
+             mock.patch.object(warp, "warp_build", lambda account: None), \
+             mock.patch.object(warp, "warp_build_stamp",
+                               side_effect=[stamp, stamp]), \
+             mock.patch.object(warp, "warp_check_data", lambda: {"ok": False}), \
+             mock.patch.object(warp, "warp_unit_state", unit_state), \
+             mock.patch.object(warp, "warp_systemctl", fake), \
+             mock.patch.object(warp, "warp_status", lambda: {}), \
+             mock.patch.object(core, "out", lambda payload: None):
+            warp.cmd_warp_on()
+        self.assertEqual([c[0] for c in calls], ["restart"])
+
+    def test_repeated_warp_off_does_not_stop_an_inactive_unit(self):
+        calls, fake, unit_state = self._recorder(False)
+
+        with mock.patch.object(warp, "warp_unit_state", unit_state), \
+             mock.patch.object(warp, "warp_systemctl", fake), \
+             mock.patch.object(warp, "warp_status", lambda: {}), \
+             mock.patch.object(core, "out", lambda payload: None):
+            warp.cmd_warp_off()
+        self.assertEqual(calls, [])
 
 
 class DpiToggleTest(SandboxTest):
-    def test_on_uses_start_and_off_uses_stop(self):
+    def _systemctl_recorder(self):
         calls = []
+        state = {"active": False}
 
         def fake(*args, **kwargs):
+            action = args[0]
             calls.append(args)
+            if action == "is-active":
+                return completed(args, 0, "active\n" if state["active"] else "inactive\n")
+            if action == "is-enabled":
+                return completed(args, 0, "enabled\n")
+            if action == "start":
+                state["active"] = True
+            if action == "stop":
+                state["active"] = False
             return completed(args)
+
+        return calls, fake
+
+    def test_on_uses_start_and_off_uses_stop(self):
+        calls, fake = self._systemctl_recorder()
 
         with mock.patch.object(core, "installed", lambda: True), \
              mock.patch.object(core, "systemctl", fake), \
@@ -694,7 +1103,22 @@ class DpiToggleTest(SandboxTest):
             self.assertTrue(core.wanted_flags()["dpi"])
             strategies.cmd_off()
             self.assertFalse(core.wanted_flags()["dpi"])
-        self.assertEqual(calls, [("start",), ("stop",)])
+        self.assertEqual([c for c in calls if c[0] in ("start", "stop")],
+                         [("start",), ("stop",)])
+
+    def test_repeated_on_and_off_do_not_touch_the_unit(self):
+        calls, fake = self._systemctl_recorder()
+
+        with mock.patch.object(core, "installed", lambda: True), \
+             mock.patch.object(core, "systemctl", fake), \
+             mock.patch.object(status, "status_data", lambda: {}), \
+             mock.patch.object(core, "out", lambda payload: None):
+            strategies.cmd_on()
+            strategies.cmd_on()
+            strategies.cmd_off()
+            strategies.cmd_off()
+        self.assertEqual([c for c in calls if c[0] in ("start", "stop")],
+                         [("start",), ("stop",)])
 
 
 class ProbeSanityTest(SandboxTest):
@@ -865,6 +1289,26 @@ class StateTest(SandboxTest):
         with mock.patch.object(core, "systemctl", lambda *a, **k: completed(a)):
             strategies.apply_spec(strategies.candidates()[0], start=True)
         self.assertTrue(core.wanted_flags()["dpi"])
+
+    def test_generate_reuses_a_fresh_measurement(self):
+        core.write_json(C.ACTIVE_FILE, {"id": "abc"}, 0o644)
+        check = {"time": 1, "passed": 3, "total": 3, "results": []}
+        core.write_json(C.PROGRESS_FILE, {
+            "running": False, "finished": int(strategies.time.time()),
+            "active_id": "abc", "wanted_dpi": True,
+            "best_summary": {"name": "best", "passed": 3, "total": 3, "ms": 100},
+            "final": check,
+        })
+
+        def unexpected(*args, **kwargs):
+            self.fail("fresh measurement must not be repeated")
+
+        with mock.patch.object(core, "installed", lambda: True), \
+             mock.patch.object(core, "curl_available", lambda: True), \
+             mock.patch.object(core, "is_running", lambda: True), \
+             mock.patch.object(strategies, "generation_baseline", side_effect=unexpected), \
+             mock.patch.object(core, "out", lambda payload: None):
+            strategies.cmd_generate()
 
     def test_progress_older_than_half_hour_is_not_running(self):
         core.write_json(C.PROGRESS_FILE, {
@@ -1108,11 +1552,15 @@ class RepairTest(SandboxTest):
             patcher.start()
             self.addCleanup(patcher.stop)
         self.probe_result = {"time": 1, "passed": 3, "total": 3, "results": []}
+        C.WARP_CONFIG.write_text("# existing config\n", encoding="utf-8")
 
     def _run(self, *, installed=True, media_reachable=True, uid=1000, running=True,
              dpi_rc=0, dpi_err="", account=None, checks=(), warp_rc=0, warp_err="",
-             wanted_dpi=True, wanted_warp=True):
+             wanted_dpi=True, wanted_warp=True, warp_active="active",
+             warp_build=None):
         checks = list(checks)
+        last_check = [{}]
+        clock = [0.0]
         calls = []
         captured = {}
 
@@ -1121,6 +1569,14 @@ class RepairTest(SandboxTest):
                 calls.append((name, args, kwargs))
                 return value(*args, **kwargs) if callable(value) else value
             return call
+
+        def next_check():
+            if checks:
+                last_check[0] = checks.pop(0)
+            return last_check[0]
+
+        def advance(_seconds):
+            clock[0] += 1
 
         dpi_cp = completed(["systemctl"], dpi_rc, "", dpi_err)
         warp_cp = completed(["systemctl"], warp_rc, "", warp_err)
@@ -1133,11 +1589,17 @@ class RepairTest(SandboxTest):
              mock.patch.object(core, "systemctl", record("systemctl", dpi_cp)), \
              mock.patch.object(core, "write_json", record("write_json", None)), \
              mock.patch.object(warp, "warp_systemctl", record("warp_systemctl", warp_cp)), \
+             mock.patch.object(warp, "warp_unit_state",
+                               record("warp_unit_state", lambda: (warp_active, ""))), \
+             mock.patch.object(warp, "warp_build", record("warp_build", warp_build)), \
              mock.patch.object(warp, "warp_account", record("warp_account", account)), \
              mock.patch.object(warp, "warp_check_data",
-                               record("warp_check_data", lambda: checks.pop(0))), \
+                               record("warp_check_data", next_check)), \
              mock.patch.object(strategies, "probe", record("probe", self.probe_result)), \
              mock.patch.object(repair, "os", SimpleNamespace(geteuid=lambda: uid)), \
+             mock.patch.object(repair, "time", SimpleNamespace(
+                 monotonic=lambda: clock[0], sleep=record("sleep", advance))), \
+             mock.patch.object(repair, "chown_for_user", record("chown_for_user", None)), \
              mock.patch.object(core, "out", captured.update):
             error = ""
             try:
@@ -1162,7 +1624,8 @@ class RepairTest(SandboxTest):
         first, _ = self._run()
         second, _ = self._run()
         self.assertEqual(second["fixes"], [])
-        self.assertEqual(second["blocked"], [])
+        self.assertEqual(second["blocked"],
+                         ["WARP: нет учётной записи — зарегистрируйте туннель"])
 
     def test_pins_media_hosts_and_keeps_a_backup(self):
         result, _ = self._run(media_reachable=False, uid=0)
@@ -1202,6 +1665,36 @@ class RepairTest(SandboxTest):
     def test_reports_a_failed_dpi_restart(self):
         result, _ = self._run(dpi_rc=1, dpi_err="unit failed\n")
         self.assertTrue(any(b.startswith("DPI: unit failed") for b in result["blocked"]))
+
+    def test_rebuilds_a_missing_warp_config(self):
+        C.WARP_CONFIG.unlink()
+        def rebuild(_account):
+            C.WARP_CONFIG.write_text("# rebuilt\n", encoding="utf-8")
+
+        result, _ = self._run(account={"id": "abc"},
+                              checks=[{"ok": False}, {"ok": True}],
+                              warp_build=rebuild)
+        self.assertTrue(C.WARP_CONFIG.exists())
+        self.assertTrue(any("конфиг WARP создан" in f for f in result["fixes"]))
+
+    def test_reports_a_warp_unit_skipped_by_systemd(self):
+        result, _ = self._run(account={"id": "abc"}, checks=[{"ok": False}],
+                              warp_active="inactive")
+        self.assertTrue(any("не активна" in b for b in result["blocked"]))
+        self.assertFalse(any("WARP перезапущен" in f for f in result["fixes"]))
+
+    def test_waits_for_a_slow_warp_proxy(self):
+        result, _ = self._run(account={"id": "abc"},
+                              checks=[{"ok": False}, {"ok": False},
+                                      {"ok": True, "colo": "DME"}])
+        self.assertIn("WARP перезапущен · подключён", result["fixes"])
+        self.assertEqual(result["blocked"], [])
+        self.assertTrue(self._call_args("sleep"))
+
+    def test_reports_when_the_warp_port_never_opens(self):
+        result, _ = self._run(account={"id": "abc"}, media_reachable=False,
+                              checks=[{"ok": False}])
+        self.assertTrue(any("порт WARP не открылся" in b for b in result["blocked"]))
 
     def test_restarts_a_stalled_warp_tunnel(self):
         result, _ = self._run(account={"id": "abc"},
@@ -1263,6 +1756,16 @@ class RepairTest(SandboxTest):
 
 
 class CoreHelpersTest(SandboxTest):
+    def test_identical_write_preserves_the_file(self):
+        path = self.base / "same.txt"
+        core.write_text(path, "same\n", 0o600)
+        before = path.stat()
+        core.write_text(path, "same\n", 0o600)
+        after = path.stat()
+        self.assertEqual(after.st_mtime_ns, before.st_mtime_ns)
+        self.assertEqual(after.st_ino, before.st_ino)
+        self.assertEqual(after.st_mode & 0o777, 0o600)
+
     def test_write_json_mode_is_applied_only_when_requested(self):
         path = self.base / "nested" / "account.json"
         core.write_json(path, {"a": 1}, mode=0o600)
@@ -1586,7 +2089,8 @@ class QmlCliContractTest(unittest.TestCase):
         self.assertIn('target: "kich.dpi-pilot"', self.pilot)
         self.assertIn("active: root.restricted || root.dpiUnhealthy", self.pilot)
         self.assertIn("onDrawerReady: function(d)", self.pilot)
-        self.assertIn("onDrawerGone: root.dpiDrawerItem = null", self.pilot)
+        self.assertIn("onDrawerGone: {", self.pilot)
+        self.assertIn("root.dpiPending = []", self.pilot)
         # The popup is lazy-loaded, so the drawer publishes itself upward
         # instead of being referenced by id from the Panel root — and only
         # after the first status reply proves it is ready for IPC actions.
@@ -1655,7 +2159,10 @@ class QmlCliContractTest(unittest.TestCase):
             self.assertNotIn(old, self.section)
         # The result line lives in the always-visible drawer header.
         self.assertIn("root.diagnosticLine]", self.section)
-        self.assertIn('.filter(Boolean).join(" · ")', self.section)
+        self.assertIn("DpiModel.joinDetail([root.stateText, root.diagnosticLine])",
+                      self.section)
+        normalized_model = " ".join(self.model.split())
+        self.assertIn('parts.filter(Boolean).join(" · ")', normalized_model)
         self.assertIn("DpiModel.diagnosticLine(st, lastCheckAll)", self.section)
         self.assertIn("DpiModel.diagnosticProblem(lastCheckAll)", self.section)
 
@@ -1777,6 +2284,53 @@ class RootInvocationTest(unittest.TestCase):
                  "HOME": "/home/session", "PKEXEC_UID": "", "SUDO_UID": "",
              }, clear=False):
             self.assertEqual(C.invoking_home(), "/home/session")
+
+
+class OwnershipTest(SandboxTest):
+    """Root repairs must leave every config parent writable by the user."""
+
+    def _fake_os(self, paths):
+        fake = SimpleNamespace(walk=os.walk,
+                               chown=lambda path, uid, gid: paths.append(
+                                   (pathlib.Path(path), uid, gid)))
+        return fake
+
+    def test_chown_tree_covers_children_and_the_root(self):
+        root = self.state / "tree"
+        child = root / "child"
+        child.mkdir(parents=True)
+        (child / "file").write_text("x", encoding="utf-8")
+        called = []
+        ownership.chown_tree(root, 1000, 1000,
+                             os_module=self._fake_os(called))
+        self.assertEqual({path for path, _, _ in called},
+                         {root, child, child / "file"})
+        self.assertTrue(all((uid, gid) == (1000, 1000) for _, uid, gid in called))
+
+    def test_chown_with_parents_includes_each_parent(self):
+        target = self.config / "state.json"
+        target.write_text("{}", encoding="utf-8")
+        called = []
+        ownership.chown_with_parents((target,), 1000, 1000,
+                                     os_module=self._fake_os(called))
+        self.assertEqual({path for path, _, _ in called}, {target, self.config})
+
+    def test_repair_chown_is_a_noop_for_regular_users(self):
+        report = repair.RepairReport()
+        with mock.patch.object(repair, "os", SimpleNamespace(geteuid=lambda: 1000)):
+            repair.chown_for_user(report, (C.STATE_FILE,))
+        self.assertEqual(report.blocked, [])
+
+    def test_repair_reports_chown_failures(self):
+        report = repair.RepairReport()
+        fake = self._fake_os([])
+        fake.chown = lambda *_args: (_ for _ in ()).throw(OSError("denied"))
+        fake.geteuid = lambda: 0
+        with mock.patch.object(repair, "os", fake), \
+             mock.patch.object(core, "target_user",
+                               return_value=SimpleNamespace(pw_uid=1000, pw_gid=1000)):
+            repair.chown_for_user(report, (C.STATE_FILE,))
+        self.assertTrue(any("права на конфигурацию" in b for b in report.blocked))
 
 
 if __name__ == "__main__":

@@ -73,7 +73,9 @@ WARP_RUN = APP_DIR / "bin" / "kich-dpi-warp-run"
 MIHOMO = ENGINE_ROOT / "mihomo"
 WARP_CONFIG = CONFIG_DIR / "warp.yaml"
 WARP_ACCOUNT = STATE_DIR / "account.json"
+WARP_WG_ACCOUNT = STATE_DIR / "wg-account.json"
 WARP_CHECK_FILE = STATE_DIR / "warp-check.json"
+WARP_BUILD_STAMP = STATE_DIR / "warp-build.json"
 
 REPAIR_DISCORD_DOMAINS = ("discord.com", "discordapp.com", "discordapp.net", "discord.gg")
 REPAIR_MEDIA_DOMAINS = ("media.discordapp.net", "images.discordapp.net")
@@ -114,6 +116,14 @@ WARP_ENDPOINTS = ("162.159.198.2", "162.159.199.2", "162.159.197.2", "162.159.19
 WARP_ENDPOINT = "162.159.199.2"
 WARP_SNI = "speed.cloudflare.com"
 WARP_MARK = "0x20000000"
+# Since 2026-04 the DME node filters DPI and googlevideo hangs there even when
+# the tunnel itself is up. MASQUE anycast always lands on DME from this host,
+# so a plain WireGuard endpoint on another node is used when available.
+WARP_WG_ENDPOINTS = (
+    "8.47.69.189:1701", "8.47.69.167:1701", "188.114.97.69:1701",
+    "8.47.69.139:1701",
+)
+WARP_WG_DME = "DME"
 
 # Root of the plugin tree: `<plugin>` for sources and `<app>` for an installed
 # copy. Both layouts contain `src/kich_dpi` or `lib/kich_dpi` respectively.

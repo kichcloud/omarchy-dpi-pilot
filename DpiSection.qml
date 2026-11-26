@@ -34,6 +34,8 @@ Item {
   property bool drawerPublished: false
   property var lastCheckAll: null
   property string actionName: ""
+  // A click made while setup/repair is still running must not be lost.
+  property var queuedActions: []
   property string actionError: ""
   // Errors from command results stay until the next action; status polls
   // must not erase a cancelled pkexec dialog.
@@ -219,8 +221,7 @@ Item {
     }
   }
 
-  // Same switch cards the drawer used before the modular rewrite: label +
-  // status on the left, a real ToggleSwitch on the right.
+  // Label and status on the left, a real ToggleSwitch on the right.
   component SwitchCard: BorderSurface {
     id: card
     property string title
@@ -288,8 +289,7 @@ Item {
       if (actionError === "") actionError = DpiModel.shortError(err) || "Менеджер не запустился"
       return
     }
-    var parsed = null
-    try { parsed = JSON.parse(String(text || "")) } catch (e) {}
+    var parsed = DpiModel.parseJsonOutput(text)
     if (!parsed || parsed.ok !== true) {
       statusReachable = false
       actionErrorSticky = false
@@ -311,7 +311,10 @@ Item {
   }
 
   function startAction(name, command, label) {
-    if (actionProc.running) return
+    if (actionProc.running) {
+      queuedActions.push({name: name, command: command, label: label})
+      return
+    }
     actionError = ""
     actionErrorSticky = false
     actionName = name
@@ -320,11 +323,16 @@ Item {
     if (label !== "") flash(label)
   }
 
+  function drainActions() {
+    if (actionProc.running || queuedActions.length === 0) return
+    var next = queuedActions.shift()
+    startAction(next.name, next.command, next.label)
+  }
+
   function finishAction(code, text, err) {
     var name = actionName
     actionName = ""
-    var parsed = null
-    try { parsed = JSON.parse(String(text || "")) } catch (e) {}
+    var parsed = DpiModel.parseJsonOutput(text)
 
     var outcome = DpiModel.actionResult(name, parsed, code, err)
     if (outcome.checkAll) lastCheckAll = outcome.checkAll
@@ -337,6 +345,7 @@ Item {
 
     if (outcome.reuseStatus) {
       applyStatus(0, text, "")
+      drainActions()
       return
     }
     if (outcome.reuseWarp) {
@@ -347,9 +356,11 @@ Item {
       }
       if (outcome.followUpWarpCheck)
         startAction("warp-check", [bin, "warp-check"], "Проверка WARP…")
+      drainActions()
       return
     }
     if (outcome.refresh) refresh()
+    drainActions()
   }
 
   function installEngine() {
@@ -437,7 +448,7 @@ Item {
         anchors.verticalCenter: parent.verticalCenter
         glyph: "󰒘"
         title: "DPI Pilot"
-        detail: [root.stateText, root.diagnosticLine].filter(Boolean).join(" · ")
+        detail: DpiModel.joinDetail([root.stateText, root.diagnosticLine])
         attention: root.unhealthy
         opened: root.expanded
         onClicked: root.toggleRequested()
@@ -635,8 +646,8 @@ Item {
           spacing: Style.space(6)
           visible: root.advanced
 
-          // The strategy list used to sit in the main view; it now lives
-          // behind "Дополнительно" like the rest of the service details.
+          // The strategy list lives behind "Дополнительно" with the rest of
+          // the service details.
           Column {
             width: parent.width
             spacing: Style.space(3)

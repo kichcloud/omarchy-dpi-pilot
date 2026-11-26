@@ -3,89 +3,53 @@ from __future__ import annotations
 
 import os
 import shutil
+import sys
+import time
 
 from . import constants as C
 from . import core
+from . import ownership
+from . import polling
+from . import repair_discord as _repair_discord
+from . import repair_report as _repair_report
+from . import repair_warp as _repair_warp
 from . import strategies
 from . import warp
 
+_self = sys.modules[__name__]
 
-class RepairReport:
-    def __init__(self):
-        self.fixes = []
-        self.blocked = []
+# mihomo needs a moment after `start` before its local proxy accepts requests.
+# A probe fired immediately after systemctl reports active always fails.
+WARP_REPAIR_WAIT_SECONDS = 15
+WARP_REPAIR_POLL_SECONDS = 1
 
-    def fixed(self, text):
-        self.fixes.append(text)
-
-    def blocked_by(self, text):
-        self.blocked.append(text)
+RepairReport = _repair_report.RepairReport
 
 
 def repair_error(cp_text, fallback):
-    return (cp_text or fallback).strip()[:160]
+    return _repair_report.repair_error(cp_text, fallback)
+
+
+def chown_for_user(report, paths):
+    """Root's pkexec repairs must leave config/rules writable by the user."""
+    if os.geteuid() != 0:
+        return
+    try:
+        user = core.target_user()
+        # The parents must be writable too: atomic writes create a temp file
+        # next to state.json / warp.yaml before replacing it.
+        ownership.chown_with_parents(paths, user.pw_uid, user.pw_gid,
+                                     os_module=os)
+    except (OSError, core.Fail) as exc:
+        report.blocked_by("права на конфигурацию: %s" % exc)
 
 
 def repair_discord_domains(report):
-    path = C.DPI_DOMAINS_FILE
-    try:
-        text = path.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        # Recreate the user's default list, not a root-owned empty file.
-        warp.ensure_user_lists()
-        try:
-            if core.os.geteuid() == 0:
-                user = core.target_user()
-                core.os.chown(path, user.pw_uid, user.pw_gid)
-        except (OSError, core.Fail):
-            pass
-        try:
-            text = path.read_text(encoding="utf-8")
-        except OSError as exc:
-            report.blocked_by("dpi-domains.txt: %s" % exc)
-            return False
-    except OSError as exc:
-        report.blocked_by("dpi-domains.txt: %s" % exc)
-        return False
-
-    current = core.list_lines(path)
-    missing = [d for d in C.REPAIR_DISCORD_DOMAINS if d not in current]
-    if not missing:
-        return False
-    prefix = "" if not text or text.endswith("\n") else "\n"
-    try:
-        with open(path, "a", encoding="utf-8") as fh:
-            fh.write(prefix + "\n".join(missing) + "\n")
-    except OSError as exc:
-        report.blocked_by("dpi-domains.txt: %s" % exc)
-        return False
-    report.fixed("домены Discord добавлены: " + ", ".join(missing))
-    return True
+    return _repair_discord.repair_discord_domains(_self, report)
 
 
 def repair_discord_media_hosts(report):
-    hosts_text = ""
-    try:
-        hosts_text = C.REPAIR_HOSTS.read_text(encoding="utf-8")
-    except OSError:
-        pass
-    if C.REPAIR_HOSTS_MARKER in hosts_text or \
-            core.tcp_reachable(C.REPAIR_MEDIA_BLOCKED_IP):
-        return
-    if os.geteuid() != 0:
-        report.blocked_by("правка /etc/hosts требует root (запустите через pkexec)")
-        return
-    try:
-        if not C.REPAIR_HOSTS_BACKUP.exists():
-            shutil.copy2(C.REPAIR_HOSTS, C.REPAIR_HOSTS_BACKUP)
-        rows = ["%s %s" % (ip, " ".join(C.REPAIR_MEDIA_DOMAINS))
-                for ip in C.REPAIR_MEDIA_GOOD_IPS]
-        with open(C.REPAIR_HOSTS, "a", encoding="utf-8") as fh:
-            fh.write("\n%s\n%s\n" % (C.REPAIR_HOSTS_MARKER, "\n".join(rows)))
-    except OSError as exc:
-        report.blocked_by("/etc/hosts: %s" % exc)
-        return
-    report.fixed("медиа-домены Discord закреплены на рабочих IP")
+    return _repair_discord.repair_discord_media_hosts(_self, report)
 
 
 def restart_dpi_for_repair(report, domains_changed):
@@ -102,22 +66,12 @@ def restart_dpi_for_repair(report, domains_changed):
                                                        "restart failed"))
 
 
+def probe_warp_after_restart():
+    return _repair_warp.probe_warp_after_restart(_self)
+
+
 def restart_warp_for_repair(report):
-    if not core.wanted_flags()["warp"]:
-        return None
-    if not warp.warp_account():
-        return None
-    check = warp.warp_check_data()
-    if check.get("ok"):
-        return check
-    cp = warp.warp_systemctl("restart", timeout=25)
-    if cp.returncode != 0:
-        report.blocked_by("WARP: " + repair_error(cp.stderr, "restart failed"))
-        return check
-    check = warp.warp_check_data()
-    state = " · подключён" if check.get("ok") else " · всё ещё не отвечает"
-    report.fixed("WARP перезапущен" + state)
-    return check
+    return _repair_warp.restart_warp_for_repair(_self, report)
 
 
 def cmd_repair():
@@ -125,6 +79,10 @@ def cmd_repair():
     if not core.installed():
         raise core.Fail("сначала установите движок")
     report = RepairReport()
+    # Heal installs whose root-run setup left ~/.config/kich-dpi unwritable.
+    chown_for_user(report, (C.STATE_FILE, C.DPI_DOMAINS_FILE,
+                            C.WARP_USER_DOMAINS, C.WARP_USER_PROCESSES,
+                            C.WARP_CONFIG))
     domains_changed = repair_discord_domains(report)
     repair_discord_media_hosts(report)
     restart_dpi_for_repair(report, domains_changed)

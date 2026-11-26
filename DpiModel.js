@@ -36,6 +36,11 @@ function stateText(reachable, installed, failed, running) {
   return "выключен"
 }
 
+// One separator rule for every composed detail line in the panel.
+function joinDetail(parts) {
+  return parts.filter(Boolean).join(" · ")
+}
+
 function shortError(text) {
   var value = String(text || "").split("\n")[0]
   return value.length > 120 ? value.substring(0, 117) + "…" : value
@@ -47,11 +52,6 @@ function whenText(check, now) {
   if (minutes < 1) return "только что"
   if (minutes < 60) return minutes + " мин назад"
   return Math.floor(minutes / 60) + " ч назад"
-}
-
-function checkText(check) {
-  if (!check || !check.total) return "проверок ещё не было"
-  return "Доступно " + check.passed + "/" + check.total + " · " + whenText(check, Date.now())
 }
 
 function progressText(progress) {
@@ -146,6 +146,18 @@ function diagnosticError(summary) {
   return diagnosticIssueParts(summary).join(" · ")
 }
 
+// pkexec/polkit can print extra lines around the single JSON envelope. Read
+// the last non-empty line so a noisy stdout cannot be mistaken for failure.
+function parseJsonOutput(text) {
+  var lines = String(text || "").split("\n")
+  for (var i = lines.length - 1; i >= 0; i--) {
+    var line = lines[i].trim()
+    if (!line) continue
+    try { return JSON.parse(line) } catch (e) {}
+  }
+  return null
+}
+
 // Every finished command is translated here. QML only applies the decision.
 function actionResult(name, parsed, code, err) {
   var result = {
@@ -158,7 +170,19 @@ function actionResult(name, parsed, code, err) {
     result.refresh = false
     return result
   }
-  if (parsed && parsed.ok === false) {
+  var privileged = name === "install" || name === "update" ||
+    name === "repair" || name === "remove"
+  if (code === 1 && !parsed && privileged) {
+    result.error = "Отменено"
+    result.refresh = false
+    return result
+  }
+  if (!parsed) {
+    result.error = shortError(err) || "Команда не вернула JSON"
+    result.refresh = false
+    return result
+  }
+  if (parsed.ok === false) {
     result.error = parsed.error || "Не удалось выполнить"
     result.refresh = false
     return result
@@ -244,11 +268,12 @@ if (typeof module !== "undefined") {
   module.exports = {
     compactAddress: compactAddress, warpCheckText: warpCheckText,
     warpText: warpText, stateText: stateText, shortError: shortError,
-    whenText: whenText, checkText: checkText, progressText: progressText,
-    findResult: findResult, recentCheck: recentCheck,
+    whenText: whenText, joinDetail: joinDetail, progressText: progressText,
+    findResult: findResult,
     dpiUnhealthy: dpiUnhealthy, warpUnhealthy: warpUnhealthy,
     hasProblem: hasProblem, diagnosticLine: diagnosticLine,
     diagnosticProblem: diagnosticProblem, diagnosticError: diagnosticError,
-    actionResult: actionResult, invoke: invoke,
+    actionResult: actionResult, parseJsonOutput: parseJsonOutput,
+    invoke: invoke,
   }
 }
