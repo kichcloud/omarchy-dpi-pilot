@@ -29,8 +29,7 @@ def repair_discord_domains(repair, report):
         return False
     prefix = "" if not text or text.endswith("\n") else "\n"
     try:
-        with open(path, "a", encoding="utf-8") as fh:
-            fh.write(prefix + "\n".join(missing) + "\n")
+        core.atomic_write(path, text + prefix + "\n".join(missing) + "\n")
     except OSError as exc:
         report.blocked_by("dpi-domains.txt: %s" % exc)
         return False
@@ -39,11 +38,11 @@ def repair_discord_domains(repair, report):
 
 
 def repair_discord_media_hosts(repair, report):
-    hosts_text = ""
     try:
         hosts_text = C.REPAIR_HOSTS.read_text(encoding="utf-8")
-    except OSError:
-        pass
+    except OSError as exc:
+        report.blocked_by("/etc/hosts: %s" % exc)
+        return
     if C.REPAIR_HOSTS_MARKER in hosts_text or \
             core.tcp_reachable(C.REPAIR_MEDIA_BLOCKED_IP):
         return
@@ -55,8 +54,8 @@ def repair_discord_media_hosts(repair, report):
             repair.shutil.copy2(C.REPAIR_HOSTS, C.REPAIR_HOSTS_BACKUP)
         rows = ["%s %s" % (ip, " ".join(C.REPAIR_MEDIA_DOMAINS))
                 for ip in C.REPAIR_MEDIA_GOOD_IPS]
-        with open(C.REPAIR_HOSTS, "a", encoding="utf-8") as fh:
-            fh.write("\n%s\n%s\n" % (C.REPAIR_HOSTS_MARKER, "\n".join(rows)))
+        core.atomic_write(C.REPAIR_HOSTS, hosts_text + "\n%s\n%s\n"
+                          % (C.REPAIR_HOSTS_MARKER, "\n".join(rows)))
     except OSError as exc:
         report.blocked_by("/etc/hosts: %s" % exc)
         return

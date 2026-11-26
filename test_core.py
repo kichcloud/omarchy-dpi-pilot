@@ -1383,7 +1383,6 @@ class StateTest(SandboxTest):
         self.assertFalse(data["running"])
         self.assertIn("error", data)
 
-
 class StatusTest(SandboxTest):
     def test_status_shape_without_engine(self):
         states = {unit: ("inactive", "not-found")
@@ -1709,6 +1708,38 @@ class RepairTest(SandboxTest):
         self.assertEqual(self._call_args("tcp_reachable"), [])
         self.assertFalse(any("закреплены" in f for f in result["fixes"]))
         self.assertFalse(C.REPAIR_HOSTS_BACKUP.exists())
+
+    def test_domains_write_is_atomic_on_failure(self):
+        before = C.DPI_DOMAINS_FILE.read_bytes()
+        with mock.patch.object(os, "replace", side_effect=OSError("disk full")):
+            result, error = self._run()
+        self.assertEqual(error, "")
+        self.assertEqual(C.DPI_DOMAINS_FILE.read_bytes(), before)
+        self.assertTrue(any("dpi-domains.txt: disk full" in b
+                            for b in result["blocked"]))
+        leftovers = [p.name for p in self.config.iterdir() if p.suffix == ".tmp"]
+        self.assertEqual(leftovers, [])
+
+    def test_hosts_write_is_atomic_on_failure(self):
+        before = self.hosts.read_bytes()
+        with mock.patch.object(os, "replace", side_effect=OSError("disk full")):
+            result, _ = self._run(media_reachable=False, uid=0)
+        self.assertEqual(self.hosts.read_bytes(), before)
+        self.assertNotIn(C.REPAIR_HOSTS_MARKER, self.hosts.read_text(encoding="utf-8"))
+        self.assertTrue(any("/etc/hosts: disk full" in b for b in result["blocked"]))
+
+    def test_repair_preserves_file_modes(self):
+        os.chmod(C.DPI_DOMAINS_FILE, 0o600)
+        os.chmod(self.hosts, 0o640)
+        self._run(media_reachable=False, uid=0)
+        self.assertEqual(C.DPI_DOMAINS_FILE.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(self.hosts.stat().st_mode & 0o777, 0o640)
+
+    def test_repeated_repair_keeps_hosts_byte_identical(self):
+        self._run(media_reachable=False, uid=0)
+        first = self.hosts.read_bytes()
+        self._run(media_reachable=False, uid=0)
+        self.assertEqual(self.hosts.read_bytes(), first)
 
     def test_media_pin_needs_root(self):
         result, _ = self._run(media_reachable=False, uid=1000)
